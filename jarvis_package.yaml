@@ -1,0 +1,83 @@
+name: "email"
+display_name: "Email (Gmail & IMAP)"
+description: "Full email management — list, read, search, send, reply, archive, trash, and star. Supports Gmail (OAuth) and IMAP/SMTP (Proton Mail, Yahoo, etc.). Includes VIP alerts and daily digest agent."
+version: "1.0.0"
+min_jarvis_version: "0.9.0"
+license: "MIT"
+author:
+  github: "alexberardi"
+categories: ["communication", "email"]
+platforms: ["darwin", "linux"]
+keywords: ["email", "gmail", "imap", "inbox", "send", "reply", "archive"]
+
+packages:
+  - name: httpx
+
+secrets:
+  - key: EMAIL_PROVIDER
+    scope: integration
+    value_type: string
+    description: "Email provider: 'gmail' (default) or 'imap'"
+    is_sensitive: false
+  - key: GMAIL_CLIENT_ID
+    scope: integration
+    value_type: string
+    description: "Google OAuth client ID (optional — default provided)"
+    is_sensitive: false
+  - key: GMAIL_ACCESS_TOKEN
+    scope: integration
+    value_type: string
+    description: "Gmail OAuth access token (auto-populated)"
+  - key: GMAIL_REFRESH_TOKEN
+    scope: integration
+    value_type: string
+    description: "Gmail OAuth refresh token (auto-populated)"
+  - key: IMAP_HOST
+    scope: integration
+    value_type: string
+    description: "IMAP server hostname"
+    is_sensitive: false
+  - key: IMAP_PORT
+    scope: integration
+    value_type: string
+    description: "IMAP server port"
+    is_sensitive: false
+  - key: IMAP_USERNAME
+    scope: integration
+    value_type: string
+    description: "IMAP/SMTP login username"
+    is_sensitive: false
+  - key: IMAP_PASSWORD
+    scope: integration
+    value_type: string
+    description: "IMAP/SMTP login password"
+  - key: SMTP_HOST
+    scope: integration
+    value_type: string
+    description: "SMTP server hostname"
+    is_sensitive: false
+  - key: SMTP_PORT
+    scope: integration
+    value_type: string
+    description: "SMTP server port"
+    is_sensitive: false
+  - key: IMAP_USE_SSL
+    scope: integration
+    value_type: string
+    description: "Use SSL instead of STARTTLS"
+    is_sensitive: false
+  - key: EMAIL_ALERT_VIP_SENDERS
+    scope: integration
+    value_type: string
+    description: "Comma-separated VIP email addresses for alerts"
+    is_sensitive: false
+  - key: EMAIL_ALERT_URGENT_KEYWORDS
+    scope: integration
+    value_type: string
+    description: "Comma-separated keywords that trigger urgent alerts"
+    is_sensitive: false
+  - key: EMAIL_ALERT_DIGEST_HOUR
+    scope: integration
+    value_type: string
+    description: "Hour (0-23) for daily email digest (default: 7)"
+    is_sensitive: false
