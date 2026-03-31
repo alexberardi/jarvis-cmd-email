@@ -31,7 +31,8 @@ def create_email_service() -> GoogleGmailService | ImapEmailService:
     """
     provider = get_email_provider()
 
-    if provider == "imap":
+    # All non-gmail providers use the IMAP/SMTP code path
+    if provider != "gmail":
         username = _storage.get_secret("IMAP_USERNAME")
         password = _storage.get_secret("IMAP_PASSWORD")
         if not username or not password:

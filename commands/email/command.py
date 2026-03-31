@@ -145,21 +145,40 @@ class EmailCommand(IJarvisCommand):
         base = [
             JarvisSecret(
                 "EMAIL_PROVIDER",
-                "Email provider: 'gmail' (default) or 'imap'",
+                "Email provider",
                 "integration", "string", required=False, is_sensitive=False,
                 friendly_name="Email Provider",
+                enum_values=["gmail", "yahoo", "outlook", "proton", "fastmail", "imap"],
+                presets={
+                    "yahoo": {
+                        "IMAP_HOST": "imap.mail.yahoo.com", "IMAP_PORT": "993",
+                        "IMAP_USE_SSL": "true", "SMTP_HOST": "smtp.mail.yahoo.com", "SMTP_PORT": "465",
+                    },
+                    "outlook": {
+                        "IMAP_HOST": "outlook.office365.com", "IMAP_PORT": "993",
+                        "IMAP_USE_SSL": "true", "SMTP_HOST": "smtp.office365.com", "SMTP_PORT": "587",
+                    },
+                    "fastmail": {
+                        "IMAP_HOST": "imap.fastmail.com", "IMAP_PORT": "993",
+                        "IMAP_USE_SSL": "true", "SMTP_HOST": "smtp.fastmail.com", "SMTP_PORT": "465",
+                    },
+                    "proton": {
+                        "IMAP_HOST": "127.0.0.1", "IMAP_PORT": "1143",
+                        "IMAP_USE_SSL": "false", "SMTP_HOST": "127.0.0.1", "SMTP_PORT": "1025",
+                    },
+                },
             ),
         ]
         provider = get_email_provider()
-        if provider == "imap":
+        if provider != "gmail":
             base.extend([
                 JarvisSecret(
-                    "IMAP_HOST", "IMAP server hostname (e.g., 127.0.0.1, imap.mail.yahoo.com)",
+                    "IMAP_HOST", "IMAP server hostname",
                     "integration", "string", required=False, is_sensitive=False,
                     friendly_name="IMAP Host",
                 ),
                 JarvisSecret(
-                    "IMAP_PORT", "IMAP server port (1143 for STARTTLS, 993 for SSL)",
+                    "IMAP_PORT", "IMAP server port (993 for SSL, 1143 for STARTTLS)",
                     "integration", "int", required=False, is_sensitive=False,
                     friendly_name="IMAP Port",
                 ),
@@ -184,7 +203,7 @@ class EmailCommand(IJarvisCommand):
                     friendly_name="SMTP Port",
                 ),
                 JarvisSecret(
-                    "IMAP_USE_SSL", "Use SSL instead of STARTTLS (true for Yahoo/Outlook, false for Proton Bridge)",
+                    "IMAP_USE_SSL", "Use SSL instead of STARTTLS",
                     "integration", "bool", required=False, is_sensitive=False,
                     friendly_name="Use SSL",
                 ),
@@ -205,9 +224,28 @@ class EmailCommand(IJarvisCommand):
         return [
             JarvisSecret(
                 "EMAIL_PROVIDER",
-                "Email provider: 'gmail' (default) or 'imap'",
+                "Email provider",
                 "integration", "string", required=False, is_sensitive=False,
                 friendly_name="Email Provider",
+                enum_values=["gmail", "yahoo", "outlook", "proton", "fastmail", "imap"],
+                presets={
+                    "yahoo": {
+                        "IMAP_HOST": "imap.mail.yahoo.com", "IMAP_PORT": "993",
+                        "IMAP_USE_SSL": "true", "SMTP_HOST": "smtp.mail.yahoo.com", "SMTP_PORT": "465",
+                    },
+                    "outlook": {
+                        "IMAP_HOST": "outlook.office365.com", "IMAP_PORT": "993",
+                        "IMAP_USE_SSL": "true", "SMTP_HOST": "smtp.office365.com", "SMTP_PORT": "587",
+                    },
+                    "fastmail": {
+                        "IMAP_HOST": "imap.fastmail.com", "IMAP_PORT": "993",
+                        "IMAP_USE_SSL": "true", "SMTP_HOST": "smtp.fastmail.com", "SMTP_PORT": "465",
+                    },
+                    "proton": {
+                        "IMAP_HOST": "127.0.0.1", "IMAP_PORT": "1143",
+                        "IMAP_USE_SSL": "false", "SMTP_HOST": "127.0.0.1", "SMTP_PORT": "1025",
+                    },
+                },
             ),
             # Gmail secrets
             JarvisSecret(
@@ -274,8 +312,8 @@ class EmailCommand(IJarvisCommand):
 
     @property
     def authentication(self) -> AuthenticationConfig | None:
-        if get_email_provider() == "imap":
-            return None  # IMAP uses username/password secrets, no OAuth
+        if get_email_provider() != "gmail":
+            return None  # Non-gmail providers use username/password secrets, no OAuth
         client_id = self._get_client_id()
         if not client_id:
             return None
