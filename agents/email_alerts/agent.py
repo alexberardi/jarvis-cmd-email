@@ -22,8 +22,8 @@ except ImportError:
 
 from jarvis_command_sdk import AgentSchedule, Alert, IJarvisAgent, IJarvisSecret, JarvisSecret, JarvisStorage
 
-from lib.email_message import extract_email
-from lib.email_service_factory import create_email_service, get_email_provider
+from email_shared.email_message import extract_email
+from email_shared.email_service_factory import create_email_service, get_email_provider
 
 _storage = JarvisStorage("email_alerts")
 

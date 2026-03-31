@@ -29,8 +29,8 @@ from jarvis_command_sdk import (
     RequestInformation,
 )
 
-from lib.email_message import EmailMessage, extract_email
-from lib.email_service_factory import create_email_service, get_email_provider
+from email_shared.email_message import EmailMessage, extract_email
+from email_shared.email_service_factory import create_email_service, get_email_provider
 
 # Default OAuth client ID — shipped with Jarvis so users don't need to create
 # their own Google Cloud project. Override via GMAIL_CLIENT_ID secret if needed.
