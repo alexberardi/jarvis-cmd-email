@@ -146,7 +146,7 @@ class EmailCommand(IJarvisCommand):
             JarvisSecret(
                 "EMAIL_PROVIDER",
                 "Email provider",
-                "integration", "string", required=False, is_sensitive=False,
+                "user", "string", required=False, is_sensitive=False,
                 friendly_name="Email Provider",
                 enum_values=["gmail", "yahoo", "outlook", "proton", "fastmail", "imap"],
                 presets={
@@ -174,37 +174,37 @@ class EmailCommand(IJarvisCommand):
             base.extend([
                 JarvisSecret(
                     "IMAP_HOST", "IMAP server hostname",
-                    "integration", "string", required=False, is_sensitive=False,
+                    "user", "string", required=False, is_sensitive=False,
                     friendly_name="IMAP Host",
                 ),
                 JarvisSecret(
                     "IMAP_PORT", "IMAP server port (993 for SSL, 1143 for STARTTLS)",
-                    "integration", "int", required=False, is_sensitive=False,
+                    "user", "string", required=False, is_sensitive=False,
                     friendly_name="IMAP Port",
                 ),
                 JarvisSecret(
                     "IMAP_USERNAME", "IMAP/SMTP login username (full email address)",
-                    "integration", "string", is_sensitive=False,
+                    "user", "string", is_sensitive=False,
                     friendly_name="IMAP Username",
                 ),
                 JarvisSecret(
                     "IMAP_PASSWORD", "IMAP/SMTP login password",
-                    "integration", "string", is_sensitive=True,
+                    "user", "string", is_sensitive=True,
                     friendly_name="IMAP Password",
                 ),
                 JarvisSecret(
                     "SMTP_HOST", "SMTP server hostname",
-                    "integration", "string", required=False, is_sensitive=False,
+                    "user", "string", required=False, is_sensitive=False,
                     friendly_name="SMTP Host",
                 ),
                 JarvisSecret(
                     "SMTP_PORT", "SMTP server port",
-                    "integration", "int", required=False, is_sensitive=False,
+                    "user", "string", required=False, is_sensitive=False,
                     friendly_name="SMTP Port",
                 ),
                 JarvisSecret(
                     "IMAP_USE_SSL", "Use SSL instead of STARTTLS",
-                    "integration", "bool", required=False, is_sensitive=False,
+                    "user", "string", required=False, is_sensitive=False,
                     friendly_name="Use SSL",
                 ),
             ])
@@ -225,7 +225,7 @@ class EmailCommand(IJarvisCommand):
             JarvisSecret(
                 "EMAIL_PROVIDER",
                 "Email provider",
-                "integration", "string", required=False, is_sensitive=False,
+                "user", "string", required=False, is_sensitive=False,
                 friendly_name="Email Provider",
                 enum_values=["gmail", "yahoo", "outlook", "proton", "fastmail", "imap"],
                 presets={
@@ -247,7 +247,7 @@ class EmailCommand(IJarvisCommand):
                     },
                 },
             ),
-            # Gmail secrets
+            # Gmail secrets (client ID is shared, tokens are per-user)
             JarvisSecret(
                 "GMAIL_CLIENT_ID",
                 "Google OAuth client ID for Gmail (optional — a default is provided)",
@@ -256,56 +256,56 @@ class EmailCommand(IJarvisCommand):
             ),
             JarvisSecret(
                 "GMAIL_ACCESS_TOKEN", "Gmail OAuth access token",
-                "integration", "string", friendly_name="Access Token",
+                "user", "string", friendly_name="Access Token",
             ),
             JarvisSecret(
                 "GMAIL_REFRESH_TOKEN", "Gmail OAuth refresh token",
-                "integration", "string", friendly_name="Refresh Token",
+                "user", "string", friendly_name="Refresh Token",
             ),
-            # IMAP secrets
+            # IMAP settings (all per-user)
             JarvisSecret(
                 "IMAP_HOST", "IMAP server hostname",
-                "integration", "string", required=False, is_sensitive=False,
+                "user", "string", required=False, is_sensitive=False,
                 friendly_name="IMAP Host",
             ),
             JarvisSecret(
                 "IMAP_PORT", "IMAP server port (1143 for STARTTLS, 993 for SSL)",
-                "integration", "int", required=False, is_sensitive=False,
+                "user", "string", required=False, is_sensitive=False,
                 friendly_name="IMAP Port",
             ),
             JarvisSecret(
                 "IMAP_USERNAME", "IMAP/SMTP login username (full email address)",
-                "integration", "string", required=False, is_sensitive=False,
+                "user", "string", required=False, is_sensitive=False,
                 friendly_name="IMAP Username",
             ),
             JarvisSecret(
                 "IMAP_PASSWORD", "IMAP/SMTP login password",
-                "integration", "string", required=False, is_sensitive=True,
+                "user", "string", required=False, is_sensitive=True,
                 friendly_name="IMAP Password",
             ),
             JarvisSecret(
                 "SMTP_HOST", "SMTP server hostname",
-                "integration", "string", required=False, is_sensitive=False,
+                "user", "string", required=False, is_sensitive=False,
                 friendly_name="SMTP Host",
             ),
             JarvisSecret(
                 "SMTP_PORT", "SMTP server port",
-                "integration", "int", required=False, is_sensitive=False,
+                "user", "string", required=False, is_sensitive=False,
                 friendly_name="SMTP Port",
             ),
             JarvisSecret(
                 "IMAP_USE_SSL", "Use SSL instead of STARTTLS for IMAP",
-                "integration", "bool", required=False, is_sensitive=False,
+                "user", "string", required=False, is_sensitive=False,
                 friendly_name="Use SSL",
             ),
             JarvisSecret(
                 "IMAP_ARCHIVE_FOLDER", "IMAP folder name for archive (default: Archive)",
-                "integration", "string", required=False, is_sensitive=False,
+                "user", "string", required=False, is_sensitive=False,
                 friendly_name="Archive Folder",
             ),
             JarvisSecret(
                 "IMAP_TRASH_FOLDER", "IMAP folder name for trash (default: Trash)",
-                "integration", "string", required=False, is_sensitive=False,
+                "user", "string", required=False, is_sensitive=False,
                 friendly_name="Trash Folder",
             ),
         ]
@@ -501,14 +501,14 @@ class EmailCommand(IJarvisCommand):
 
         # Auth check — provider-aware
         provider = get_email_provider()
-        if provider == "imap":
-            if not self._storage.get_secret("IMAP_USERNAME") or not self._storage.get_secret("IMAP_PASSWORD"):
+        if provider != "gmail":
+            if not self._storage.get_secret("IMAP_USERNAME", scope="user") or not self._storage.get_secret("IMAP_PASSWORD", scope="user"):
                 return CommandResponse.error_response(
-                    error_details="IMAP not configured. Set IMAP_USERNAME and IMAP_PASSWORD secrets.",
+                    error_details="Email not configured. Set IMAP username and password in settings.",
                     context_data={"error": "Not configured"},
                 )
         else:
-            access_token = self._storage.get_secret("GMAIL_ACCESS_TOKEN")
+            access_token = self._storage.get_secret("GMAIL_ACCESS_TOKEN", scope="user")
             if not access_token:
                 return CommandResponse.error_response(
                     error_details="Gmail not authenticated. Complete OAuth setup first.",
