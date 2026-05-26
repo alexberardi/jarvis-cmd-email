@@ -15,9 +15,9 @@ packages:
 
 secrets:
   - key: EMAIL_PROVIDER
-    scope: integration
+    scope: user
     value_type: string
-    description: "Email provider: 'gmail' (default) or 'imap'"
+    description: "Email provider: 'gmail' (default), 'yahoo', 'outlook', 'proton', 'fastmail', or 'imap'"
     is_sensitive: false
   - key: GMAIL_CLIENT_ID
     scope: integration
@@ -25,46 +25,56 @@ secrets:
     description: "Google OAuth client ID (optional — default provided)"
     is_sensitive: false
   - key: GMAIL_ACCESS_TOKEN
-    scope: integration
+    scope: user
     value_type: string
     description: "Gmail OAuth access token (auto-populated)"
   - key: GMAIL_REFRESH_TOKEN
-    scope: integration
+    scope: user
     value_type: string
     description: "Gmail OAuth refresh token (auto-populated)"
   - key: IMAP_HOST
-    scope: integration
+    scope: user
     value_type: string
     description: "IMAP server hostname"
     is_sensitive: false
   - key: IMAP_PORT
-    scope: integration
+    scope: user
     value_type: string
     description: "IMAP server port"
     is_sensitive: false
   - key: IMAP_USERNAME
-    scope: integration
+    scope: user
     value_type: string
-    description: "IMAP/SMTP login username"
+    description: "IMAP/SMTP login username (full email address)"
     is_sensitive: false
   - key: IMAP_PASSWORD
-    scope: integration
+    scope: user
     value_type: string
     description: "IMAP/SMTP login password"
   - key: SMTP_HOST
-    scope: integration
+    scope: user
     value_type: string
     description: "SMTP server hostname"
     is_sensitive: false
   - key: SMTP_PORT
-    scope: integration
+    scope: user
     value_type: string
     description: "SMTP server port"
     is_sensitive: false
   - key: IMAP_USE_SSL
-    scope: integration
+    scope: user
     value_type: string
     description: "Use SSL instead of STARTTLS"
+    is_sensitive: false
+  - key: IMAP_ARCHIVE_FOLDER
+    scope: user
+    value_type: string
+    description: "IMAP folder name for archive (default: Archive)"
+    is_sensitive: false
+  - key: IMAP_TRASH_FOLDER
+    scope: user
+    value_type: string
+    description: "IMAP folder name for trash (default: Trash)"
     is_sensitive: false
   - key: EMAIL_ALERT_VIP_SENDERS
     scope: integration
@@ -78,6 +88,6 @@ secrets:
     is_sensitive: false
   - key: EMAIL_ALERT_DIGEST_HOUR
     scope: integration
-    value_type: string
+    value_type: int
     description: "Hour (0-23) for daily email digest (default: 7)"
     is_sensitive: false
