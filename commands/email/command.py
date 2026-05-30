@@ -19,6 +19,7 @@ from jarvis_command_sdk import (
     AuthenticationConfig,
     CommandExample,
     CommandResponse,
+    FastPathPattern,
     IJarvisButton,
     IJarvisCommand,
     IJarvisParameter,
@@ -26,6 +27,7 @@ from jarvis_command_sdk import (
     JarvisParameter,
     JarvisSecret,
     JarvisStorage,
+    PreRouteResult,
     RequestInformation,
 )
 
@@ -46,6 +48,77 @@ _ORDINALS: dict[str, int] = {
 }
 
 _ALL_ACTIONS = ["list", "read", "search", "send", "reply", "archive", "trash", "star"]
+
+# --- Pre-route patterns ---
+# Ordinal | number alternation used in several patterns. Longest-first so
+# "seventh" doesn't get caught by "seven".
+_ORDINAL_ALT = "|".join(sorted(_ORDINALS, key=len, reverse=True))
+
+# "check my email" / "any new emails" / "what's in my inbox" — all list.
+_LIST_RE = re.compile(
+    r"^\s*(?:"
+    r"check\s+(?:my\s+)?(?:email|emails|inbox|gmail|mail|messages)"
+    r"|any\s+new\s+(?:emails?|messages|mail)"
+    r"|what'?s\s+(?:in\s+)?my\s+inbox"
+    r"|do\s+i\s+have\s+(?:any\s+)?(?:emails?|mail|messages|new\s+messages)"
+    r"|read\s+my\s+emails?"
+    r"|show\s+me\s+my\s+(?:inbox|emails?|mail)"
+    r"|what\s+emails?\s+do\s+i\s+have"
+    r")\s*[?.!]*$",
+    re.IGNORECASE,
+)
+
+# "read email N" / "read the Nth email" / "open email number N"
+_READ_RE = re.compile(
+    r"^\s*(?:read|open|show\s+me)\s+(?:the\s+)?"
+    r"(?:email\s+(?:number\s+)?(?P<num>\d+|" + _ORDINAL_ALT + r")"
+    r"|(?P<num2>" + _ORDINAL_ALT + r")\s+(?:email|one)"
+    r"|(?P<num3>\d+)(?:st|nd|rd|th)?\s+email)"
+    r"\s*[?.!]*$",
+    re.IGNORECASE,
+)
+
+# "archive email N" / "archive the Nth email" / "move email N to archive"
+_ARCHIVE_RE = re.compile(
+    r"^\s*archive\s+(?:the\s+)?"
+    r"(?:email\s+(?:number\s+)?(?P<num>\d+|" + _ORDINAL_ALT + r")"
+    r"|(?P<num2>" + _ORDINAL_ALT + r")\s+email)"
+    r"\s*[?.!]*$",
+    re.IGNORECASE,
+)
+
+_ARCHIVE_TO_RE = re.compile(
+    r"^\s*move\s+email\s+(?P<num>\d+|" + _ORDINAL_ALT + r")\s+to\s+(?:the\s+)?archive\s*[?.!]*$",
+    re.IGNORECASE,
+)
+
+# "delete email N" / "trash the Nth email" / "remove email N"
+_TRASH_RE = re.compile(
+    r"^\s*(?:delete|trash|remove)\s+(?:the\s+)?"
+    r"(?:email\s+(?:number\s+)?(?P<num>\d+|" + _ORDINAL_ALT + r")"
+    r"|(?P<num2>" + _ORDINAL_ALT + r")\s+email)"
+    r"\s*[?.!]*$",
+    re.IGNORECASE,
+)
+
+# "star email N" / "star the Nth email"
+_STAR_RE = re.compile(
+    r"^\s*star\s+(?:the\s+)?"
+    r"(?:email\s+(?:number\s+)?(?P<num>\d+|" + _ORDINAL_ALT + r")"
+    r"|(?P<num2>" + _ORDINAL_ALT + r")\s+email)"
+    r"\s*[?.!]*$",
+    re.IGNORECASE,
+)
+
+
+def _parse_index_token(token: str) -> int | None:
+    """Map an ordinal word or digit token to a 1-based index. None on miss."""
+    if not token:
+        return None
+    norm = token.lower().strip()
+    if norm.isdigit():
+        return int(norm)
+    return _ORDINALS.get(norm)
 
 
 class EmailCommand(IJarvisCommand):
@@ -455,6 +528,96 @@ class EmailCommand(IJarvisCommand):
             CommandExample(voice, params, is_primary)
             for voice, params, is_primary in examples
         ]
+
+    # ------------------------------------------------------------------
+    # Fast-path patterns — bypass LLM for deterministic email actions.
+    # Send/reply/search fall through because they need natural-language
+    # extraction of recipient/subject/body/query the LLM handles better.
+    # ------------------------------------------------------------------
+
+    @property
+    def fast_path_patterns(self) -> List[FastPathPattern]:
+        return [
+            FastPathPattern(
+                id="email.list",
+                description="Bypass LLM for 'check my email' / 'any new emails' / 'what's in my inbox'",
+                example="check my email",
+                regex=_LIST_RE.pattern,
+                handler="_fp_list",
+            ),
+            FastPathPattern(
+                id="email.read",
+                description="Bypass LLM for 'read email N' / 'read the Nth email'",
+                example="read email 3",
+                regex=_READ_RE.pattern,
+                handler="_fp_read",
+            ),
+            FastPathPattern(
+                id="email.archive",
+                description="Bypass LLM for 'archive email N' / 'archive the Nth email'",
+                example="archive email 2",
+                regex=_ARCHIVE_RE.pattern,
+                handler="_fp_archive",
+            ),
+            FastPathPattern(
+                id="email.archive_to",
+                description="Bypass LLM for 'move email N to archive'",
+                example="move email 2 to archive",
+                regex=_ARCHIVE_TO_RE.pattern,
+                handler="_fp_archive_to",
+            ),
+            FastPathPattern(
+                id="email.trash",
+                description="Bypass LLM for 'delete email N' / 'trash the Nth email'",
+                example="delete email 3",
+                regex=_TRASH_RE.pattern,
+                handler="_fp_trash",
+            ),
+            FastPathPattern(
+                id="email.star",
+                description="Bypass LLM for 'star email N' / 'star the Nth email'",
+                example="star email 1",
+                regex=_STAR_RE.pattern,
+                handler="_fp_star",
+            ),
+        ]
+
+    def _fp_list(self, match, voice_command: str) -> PreRouteResult | None:
+        return PreRouteResult(arguments={"action": "list"})
+
+    def _fp_read(self, match, voice_command: str) -> PreRouteResult | None:
+        token = match.group("num") or match.group("num2") or match.group("num3")
+        idx = _parse_index_token(token)
+        if idx is None:
+            return None
+        return PreRouteResult(arguments={"action": "read", "email_index": idx})
+
+    def _fp_archive(self, match, voice_command: str) -> PreRouteResult | None:
+        token = match.group("num") or match.group("num2")
+        idx = _parse_index_token(token)
+        if idx is None:
+            return None
+        return PreRouteResult(arguments={"action": "archive", "email_index": idx})
+
+    def _fp_archive_to(self, match, voice_command: str) -> PreRouteResult | None:
+        idx = _parse_index_token(match.group("num"))
+        if idx is None:
+            return None
+        return PreRouteResult(arguments={"action": "archive", "email_index": idx})
+
+    def _fp_trash(self, match, voice_command: str) -> PreRouteResult | None:
+        token = match.group("num") or match.group("num2")
+        idx = _parse_index_token(token)
+        if idx is None:
+            return None
+        return PreRouteResult(arguments={"action": "trash", "email_index": idx})
+
+    def _fp_star(self, match, voice_command: str) -> PreRouteResult | None:
+        token = match.group("num") or match.group("num2")
+        idx = _parse_index_token(token)
+        if idx is None:
+            return None
+        return PreRouteResult(arguments={"action": "star", "email_index": idx})
 
     # -- Action handler (for interactive send/reply confirm) --------------------
 
