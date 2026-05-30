@@ -680,9 +680,9 @@ class EmailCommand(IJarvisCommand):
 
         try:
             if action == "list":
-                return self._run_list(**kwargs)
+                return self._run_list(request_info, **kwargs)
             elif action == "read":
-                return self._run_read(**kwargs)
+                return self._run_read(request_info, **kwargs)
             elif action == "search":
                 return self._run_search(**kwargs)
             elif action == "send":
@@ -712,7 +712,7 @@ class EmailCommand(IJarvisCommand):
         """Construct the email service for the configured provider."""
         return create_email_service()
 
-    def _run_list(self, **kwargs: Any) -> CommandResponse:
+    def _run_list(self, request_info: RequestInformation, **kwargs: Any) -> CommandResponse:
         max_results: int = kwargs.get("max_results") or 5
         service = self._get_service()
         emails = service.search("is:unread in:inbox", max_results=max_results)
@@ -730,11 +730,27 @@ class EmailCommand(IJarvisCommand):
             for i, e in enumerate(emails)
         ]
 
-        return CommandResponse.follow_up_response(
-            context_data={"emails": formatted, "total_results": len(emails)}
-        )
+        ctx: dict[str, Any] = {"emails": formatted, "total_results": len(emails)}
+        # Pre-route callers have no LLM downstream — pre-compose a spoken
+        # summary so the wrapper sees a `message` and doesn't fall through
+        # to the LLM path.
+        if request_info.is_pre_routed:
+            if not emails:
+                ctx["message"] = "You have no unread emails."
+            else:
+                top = ", ".join(
+                    f"{e.sender_name}: {e.subject}".strip().rstrip(":")
+                    for e in emails[:3]
+                )
+                rest = (
+                    f", and {len(emails) - 3} more" if len(emails) > 3 else ""
+                )
+                ctx["message"] = (
+                    f"You have {len(emails)} unread email{'s' if len(emails) != 1 else ''}. {top}{rest}."
+                )
+        return CommandResponse.follow_up_response(context_data=ctx)
 
-    def _run_read(self, **kwargs: Any) -> CommandResponse:
+    def _run_read(self, request_info: RequestInformation, **kwargs: Any) -> CommandResponse:
         email_index: int | None = kwargs.get("email_index")
         if email_index is None:
             return CommandResponse.error_response(
@@ -752,17 +768,26 @@ class EmailCommand(IJarvisCommand):
                 error_details="Could not fetch the email. It may have been deleted."
             )
 
-        return CommandResponse.follow_up_response(
-            context_data={
-                "email": {
-                    "sender": full_email.sender_name,
-                    "sender_email": full_email.sender,
-                    "subject": full_email.subject,
-                    "date": full_email.date.isoformat(),
-                    "body": full_email.body,
-                }
+        ctx: dict[str, Any] = {
+            "email": {
+                "sender": full_email.sender_name,
+                "sender_email": full_email.sender,
+                "subject": full_email.subject,
+                "date": full_email.date.isoformat(),
+                "body": full_email.body,
             }
-        )
+        }
+        if request_info.is_pre_routed:
+            # Truncate body to ~600 chars so TTS doesn't read a 5-minute
+            # email aloud — the user can request "read more" or open it on
+            # their phone if they need the full text.
+            body = (full_email.body or "").strip()
+            body_short = body[:600] + ("…" if len(body) > 600 else "")
+            ctx["message"] = (
+                f"Email from {full_email.sender_name}, subject: {full_email.subject}. "
+                f"{body_short}"
+            ).strip()
+        return CommandResponse.follow_up_response(context_data=ctx)
 
     def _run_search(self, **kwargs: Any) -> CommandResponse:
         query: str | None = kwargs.get("query")
