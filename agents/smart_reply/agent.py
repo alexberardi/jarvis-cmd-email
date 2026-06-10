@@ -1,0 +1,409 @@
+"""SmartReplyAgent — LLM-drafted replies for important unread email.
+
+Runs every 5 minutes. The whole feature is OFF until the user sets the
+EMAIL_NOTIFICATION_FILTER secret (their free-text importance rule). Each run:
+
+1. Search unread inbox mail from the last day, drop already-drafted ids.
+2. LLM call 1 — strict indices filter (fail-closed, same discipline as the
+   news alerts agent): which emails match the user's rule.
+3. LLM call 2 per match — write a brief draft reply, or decline
+   (should_reply=false) for mail that needs no response.
+4. Post the draft to the inbox (InboxDetail surface) with Send/Ignore
+   buttons dispatching to the email command's send_draft_reply /
+   dismiss_draft callbacks. Nothing is ever auto-sent — the tap IS the
+   confirmation, with the draft on screen.
+
+Dedup is PERSISTENT: JarvisStorage records keyed by message id with a 7-day
+TTL, so drafts survive restarts. (The alerts agent's in-memory dedup
+re-alerts after a restart; a duplicate draft push would be far worse.)
+"""
+
+import json
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List
+
+try:
+    from jarvis_log_client import JarvisLogger
+    logger = JarvisLogger(service="jarvis-node")
+except ImportError:
+    import logging
+    logger = logging.getLogger("jarvis-cmd-email")
+
+from jarvis_command_sdk import (
+    AgentSchedule,
+    IJarvisAgent,
+    IJarvisSecret,
+    JarvisInbox,
+    JarvisSecret,
+    JarvisStorage,
+)
+
+from email_shared.email_service_factory import create_email_service, get_email_provider
+
+# Records (drafted-id dedup) live under this namespace; secret reads are
+# global by (key, scope) so the same facade serves both.
+_storage = JarvisStorage("email_smart_reply")
+
+REFRESH_INTERVAL_SECONDS = 300  # 5 minutes
+SEARCH_QUERY = "is:unread in:inbox newer_than:1d"
+SEARCH_MAX_RESULTS = 20
+MAX_DRAFTS_PER_RUN = 2
+DRAFT_BODY_CHARS = 3000
+DEDUP_TTL_DAYS = 7
+CATEGORY = "smart_reply"  # unknown to mobile → InboxDetail fallback (body + elements)
+
+_DRAFT_SYSTEM = (
+    "You write brief reply drafts on behalf of the user. Read the email and "
+    "draft a short reply the user could send as-is:\n"
+    "- Plain text only. At most 150 words. No signature, no subject line, "
+    "no markdown.\n"
+    "- Be direct and polite; match the sender's tone.\n"
+    "- If the email needs no response (newsletters, receipts, FYI-only "
+    "mail), set should_reply to false.\n"
+    'Output ONLY JSON: {"should_reply": true|false, "draft": "..."} — '
+    "no prose, no code fences, no explanation."
+)
+
+
+def _strip_llm_noise(raw: str) -> str:
+    """Strip <think> blocks and markdown code fences from an LLM response."""
+    cleaned = re.sub(
+        r"<think>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE
+    ).strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned
+
+
+class SmartReplyAgent(IJarvisAgent):
+    """Background agent that drafts replies for filter-matched unread email."""
+
+    @property
+    def name(self) -> str:
+        return "smart_reply"
+
+    @property
+    def description(self) -> str:
+        return "Drafts replies for important unread emails matching the user's filter"
+
+    @property
+    def schedule(self) -> AgentSchedule:
+        return AgentSchedule(
+            interval_seconds=REFRESH_INTERVAL_SECONDS,
+            run_on_startup=False,
+        )
+
+    @property
+    def required_secrets(self) -> List[IJarvisSecret]:
+        return [
+            JarvisSecret(
+                "EMAIL_NOTIFICATION_FILTER",
+                "Free-text rule for which emails deserve a drafted reply "
+                "(e.g. 'clients, invoices, anything from my kid's school'). "
+                "Leave blank to disable smart replies.",
+                "integration",
+                "string",
+                required=False,
+                is_sensitive=False,
+                friendly_name="Smart Reply Filter",
+            ),
+        ]
+
+    def validate_secrets(self) -> List[str]:
+        """Agent requires email credentials to function."""
+        provider = get_email_provider()
+        if provider == "imap":
+            missing: list[str] = []
+            if not _storage.get_secret("IMAP_USERNAME"):
+                missing.append("IMAP_USERNAME")
+            if not _storage.get_secret("IMAP_PASSWORD"):
+                missing.append("IMAP_PASSWORD")
+            return missing
+        # Gmail
+        if not _storage.get_secret("GMAIL_ACCESS_TOKEN"):
+            return ["GMAIL_ACCESS_TOKEN"]
+        return []
+
+    @property
+    def include_in_context(self) -> bool:
+        return False
+
+    async def run(self) -> None:
+        """Filter unread email and post draft replies to the inbox."""
+        try:
+            missing = self.validate_secrets()
+            if missing:
+                return
+
+            filter_text = self._read_filter()
+            if not filter_text:
+                return  # feature is OFF until the user writes a rule
+
+            try:
+                service = create_email_service()
+            except ValueError:
+                return
+
+            emails = service.search(SEARCH_QUERY, max_results=SEARCH_MAX_RESULTS)
+            candidates = [e for e in emails if not self._already_drafted(e.id)]
+            if not candidates:
+                return
+
+            matched = self._filter_emails(filter_text, candidates)[:MAX_DRAFTS_PER_RUN]
+
+            posted = 0
+            for email in matched:
+                if posted >= MAX_DRAFTS_PER_RUN:
+                    break
+                full = service.fetch_message(email.id, max_body_chars=DRAFT_BODY_CHARS)
+                if not full:
+                    continue  # transient fetch failure — retry next run
+                status, draft = self._generate_draft(full)
+                if status == "no_llm":
+                    # LLM unreachable — fail closed for the rest of this run,
+                    # retry on the next one.
+                    break
+                if status != "ok":
+                    # Parse fail / should_reply false — mark drafted so we
+                    # don't burn LLM calls retrying the same email forever.
+                    self._mark_drafted(full.id)
+                    continue
+                tag = self._post_draft(full, draft)
+                if tag == "ok":
+                    self._mark_drafted(full.id)
+                    posted += 1
+                else:
+                    # Not marked drafted — transient post failures retry next run.
+                    logger.warning(
+                        "Smart reply inbox post failed",
+                        reason=tag,
+                        message_id=full.id,
+                    )
+
+            if posted:
+                logger.info("Smart reply agent posted drafts", count=posted)
+
+        except Exception as e:
+            logger.error("Smart reply agent run failed", error=str(e))
+
+    # ── Filter (LLM call 1) ────────────────────────────────────────────────
+
+    def _read_filter(self) -> str:
+        """Return the user's EMAIL_NOTIFICATION_FILTER value (empty string if unset)."""
+        return (_storage.get_secret("EMAIL_NOTIFICATION_FILTER") or "").strip()
+
+    def _filter_emails(self, filter_text: str, emails: List[Any]) -> List[Any]:
+        """Ask the LLM which emails match the user's rule. Returns subset.
+
+        Single LLM call returning only matching email numbers — keeps the
+        decision deterministic to verify and prevents the model from
+        smuggling in non-matching emails through composition.
+
+        Fail-CLOSED contract: when a filter is set and we can't reliably
+        determine matches (LLM unreachable, malformed output, no parseable
+        indices), we return [] rather than drafting replies to mail the user
+        didn't ask about. The next run will retry.
+        """
+        try:
+            from services.node_llm_client import ask_llm
+        except ImportError:
+            logger.warning("Smart reply filter: ask_llm unavailable; skipping run (fail-closed)")
+            return []
+
+        if not emails:
+            return []
+
+        email_lines = []
+        for i, e in enumerate(emails, start=1):
+            email_lines.append(
+                f"{i}. From: {e.sender}\n"
+                f"   Subject: {e.subject}\n"
+                f"   {(e.snippet or '').strip()[:300]}"
+            )
+
+        system = (
+            "You are a strict email filter. Your only job is to identify "
+            "which emails match the user's rule. Treat the rule as a HARD "
+            "constraint:\n"
+            "- Match only emails that CLEARLY and DIRECTLY satisfy the rule.\n"
+            "- Tangential, adjacent, or 'kind of related' emails do NOT match.\n"
+            "- When in doubt, SKIP the email. The cost of a false negative "
+            "(missing one match) is much lower than a false positive "
+            "(drafting a reply to an email the user explicitly asked not to "
+            "be bothered about).\n"
+            "- Do NOT rewrite, summarize, or compose anything. Output ONLY a "
+            "JSON array of the matching email numbers."
+        )
+
+        prompt = (
+            f'The user\'s rule:\n"""\n{filter_text}\n"""\n\n'
+            f"Emails ({len(emails)} total):\n\n"
+            + "\n\n".join(email_lines) +
+            "\n\nReturn the numbers of emails that match the rule, as a JSON "
+            'array. Example: [1, 4, 7]. If nothing matches, return: []. '
+            "Output ONLY the array — no prose, no code fences, no explanation."
+        )
+
+        raw = ask_llm(prompt, system=system) or ""
+        if not raw:
+            logger.warning(
+                "Smart reply filter: empty LLM response; skipping run (fail-closed)",
+                email_count=len(emails),
+            )
+            return []
+
+        cleaned = _strip_llm_noise(raw)
+        # Find the first JSON array
+        match = re.search(r"\[[^\[\]]*\]", cleaned, re.DOTALL)
+        if match:
+            cleaned = match.group(0)
+
+        try:
+            parsed = json.loads(cleaned)
+            if not isinstance(parsed, list):
+                raise ValueError("expected a JSON array of indices")
+        except Exception as e:
+            logger.warning(
+                "Smart reply filter: parse failed; skipping run (fail-closed)",
+                error=str(e),
+                raw=raw[:200],
+            )
+            return []
+
+        matched: List[Any] = []
+        for idx in parsed:
+            try:
+                i = int(idx)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= i <= len(emails):
+                matched.append(emails[i - 1])
+
+        logger.info(
+            "Smart reply filter applied",
+            input_emails=len(emails),
+            matched=len(matched),
+        )
+        return matched
+
+    # ── Draft generation (LLM call 2) ──────────────────────────────────────
+
+    def _generate_draft(self, email: Any) -> tuple[str, str]:
+        """Draft a reply to one email. Returns ``(status, draft)``.
+
+        Statuses:
+        - ``"ok"`` — draft is usable
+        - ``"no_llm"`` — LLM unreachable/empty (transient; do NOT mark drafted)
+        - ``"parse_fail"`` — malformed output (mark drafted, don't retry forever)
+        - ``"no_reply"`` — model says the email needs no response (mark drafted)
+        """
+        try:
+            from services.node_llm_client import ask_llm
+        except ImportError:
+            logger.warning("Smart reply draft: ask_llm unavailable (fail-closed)")
+            return "no_llm", ""
+
+        prompt = (
+            f"From: {email.sender}\n"
+            f"Subject: {email.subject}\n\n"
+            f"{email.body or email.snippet}"
+        )
+
+        raw = ask_llm(prompt, system=_DRAFT_SYSTEM) or ""
+        if not raw:
+            logger.warning(
+                "Smart reply draft: empty LLM response (fail-closed)",
+                message_id=email.id,
+            )
+            return "no_llm", ""
+
+        cleaned = _strip_llm_noise(raw)
+        # Find the first JSON object
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            cleaned = match.group(0)
+
+        try:
+            parsed = json.loads(cleaned)
+            if not isinstance(parsed, dict):
+                raise ValueError("expected a JSON object")
+        except Exception as e:
+            logger.warning(
+                "Smart reply draft: parse failed",
+                error=str(e),
+                raw=raw[:200],
+                message_id=email.id,
+            )
+            return "parse_fail", ""
+
+        if not parsed.get("should_reply"):
+            return "no_reply", ""
+
+        draft = str(parsed.get("draft") or "").strip()
+        if not draft:
+            return "parse_fail", ""
+        return "ok", draft
+
+    # ── Inbox post ─────────────────────────────────────────────────────────
+
+    def _post_draft(self, email: Any, draft: str) -> str:
+        """Post one draft to the inbox with Send/Ignore buttons. Returns the post tag."""
+        body = (
+            f"From: {email.sender}\n"
+            f"Subject: {email.subject}\n\n"
+            f"{email.snippet}\n\n"
+            "— Draft reply —\n\n"
+            f"{draft}"
+        )
+        elements = [
+            {
+                "id": f"send-{email.id}",
+                "label": "Send reply",
+                "kind": "send",
+                "command": "email",
+                "callback": "send_draft_reply",
+                "data": {
+                    "message_id": email.id,
+                    "thread_id": email.thread_id,
+                    "body": draft,
+                },
+                "navigation_type": "stack",
+            },
+            {
+                # No navigation_type ⇒ new_notification fire-and-forget;
+                # the chip just checks off.
+                "id": f"ignore-{email.id}",
+                "label": "Ignore",
+                "command": "email",
+                "callback": "dismiss_draft",
+                "data": {"message_id": email.id},
+            },
+        ]
+        return JarvisInbox("email").post(
+            title=f"Reply ready — {email.sender_name}",
+            summary=email.subject,
+            body=body,
+            category=CATEGORY,
+            interactive_elements=elements,
+            user_id=None,
+            create_push_notification=True,
+            target_type="household",
+        )
+
+    # ── Persistent dedup ───────────────────────────────────────────────────
+
+    def _already_drafted(self, message_id: str) -> bool:
+        return _storage.get(message_id) is not None
+
+    def _mark_drafted(self, message_id: str) -> None:
+        now = datetime.now(timezone.utc)
+        _storage.save(
+            message_id,
+            {"drafted_at": now.isoformat()},
+            expires_at=now + timedelta(days=DEDUP_TTL_DAYS),
+        )
+
+    def get_context_data(self) -> Dict[str, Any]:
+        return {}

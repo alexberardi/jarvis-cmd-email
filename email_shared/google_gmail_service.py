@@ -20,7 +20,12 @@ except ImportError:
     import logging
     logger = logging.getLogger("jarvis-cmd-email")
 
-from .email_message import EmailMessage, extract_email, extract_name
+from .email_message import (
+    EmailMessage,
+    extract_email,
+    extract_name,
+    parse_unsubscribe_headers,
+)
 
 BASE_URL = "https://gmail.googleapis.com/gmail/v1"
 
@@ -230,6 +235,14 @@ class GoogleGmailService:
         """Remove star from a message."""
         return self.modify_labels(message_id, remove_labels=["STARRED"])
 
+    def mark_read(self, message_id: str) -> bool:
+        """Mark a message as read (remove UNREAD label)."""
+        return self.modify_labels(message_id, remove_labels=["UNREAD"])
+
+    def mark_unread(self, message_id: str) -> bool:
+        """Mark a message as unread (add UNREAD label)."""
+        return self.modify_labels(message_id, add_labels=["UNREAD"])
+
     # -- Internal helpers -------------------------------------------------------
 
     def _fetch_message_detail(self, message_id: str) -> dict | None:
@@ -270,6 +283,11 @@ class GoogleGmailService:
         # Extract plain-text body (truncated for voice readability)
         body = self._extract_body(raw.get("payload", {}), max_chars=max_body_chars)
 
+        unsubscribe_url, unsubscribe_mailto, unsubscribe_one_click = parse_unsubscribe_headers(
+            headers.get("list-unsubscribe", ""),
+            headers.get("list-unsubscribe-post", ""),
+        )
+
         return EmailMessage(
             id=raw["id"],
             thread_id=raw.get("threadId", ""),
@@ -280,6 +298,9 @@ class GoogleGmailService:
             date=date,
             is_unread="UNREAD" in labels,
             body=body,
+            unsubscribe_url=unsubscribe_url,
+            unsubscribe_mailto=unsubscribe_mailto,
+            unsubscribe_one_click=unsubscribe_one_click,
         )
 
     @staticmethod

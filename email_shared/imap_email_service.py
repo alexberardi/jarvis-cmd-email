@@ -2,6 +2,10 @@
 
 Same public interface as GoogleGmailService. Designed for Proton Mail Bridge,
 Fastmail, self-hosted IMAP, etc. Connects per operation (no persistent connections).
+
+Message ids are IMAP UIDs (all commands go through ``conn.uid(...)``), which are
+stable across sessions and expunges — unlike sequence numbers, which are renumbered
+whenever any message is expunged. Callers may persist these ids and act on them later.
 """
 
 import email as email_lib
@@ -19,7 +23,12 @@ except ImportError:
     import logging
     logger = logging.getLogger("jarvis-cmd-email")
 
-from .email_message import EmailMessage, extract_email, extract_name
+from .email_message import (
+    EmailMessage,
+    extract_email,
+    extract_name,
+    parse_unsubscribe_headers,
+)
 
 
 class ImapEmailService:
@@ -80,7 +89,7 @@ class ImapEmailService:
                 conn.select(folder, readonly=True)
 
                 imap_criteria = self._translate_query(query)
-                status, data = conn.search(None, *imap_criteria)
+                status, data = conn.uid("SEARCH", None, *imap_criteria)
                 if status != "OK":
                     return []
 
@@ -124,7 +133,7 @@ class ImapEmailService:
             conn = self._connect_imap()
             try:
                 conn.select("INBOX", readonly=True)
-                status, data = conn.fetch(message_id, "(RFC822 FLAGS)")
+                status, data = conn.uid("FETCH", message_id, "(RFC822 FLAGS)")
                 if status != "OK" or not data or data[0] is None:
                     return None
                 raw_email = data[0][1]
@@ -196,11 +205,11 @@ class ImapEmailService:
             conn = self._connect_imap()
             try:
                 conn.select("INBOX")
-                status, _ = conn.copy(message_id, self.archive_folder)
+                status, _ = conn.uid("COPY", message_id, self.archive_folder)
                 if status != "OK":
                     logger.error("IMAP COPY to archive failed", message_id=message_id)
                     return False
-                conn.store(message_id, "+FLAGS", "\\Deleted")
+                conn.uid("STORE", message_id, "+FLAGS", "\\Deleted")
                 conn.expunge()
                 return True
             finally:
@@ -218,11 +227,11 @@ class ImapEmailService:
             conn = self._connect_imap()
             try:
                 conn.select("INBOX")
-                status, _ = conn.copy(message_id, self.trash_folder)
+                status, _ = conn.uid("COPY", message_id, self.trash_folder)
                 if status != "OK":
                     logger.error("IMAP COPY to trash failed", message_id=message_id)
                     return False
-                conn.store(message_id, "+FLAGS", "\\Deleted")
+                conn.uid("STORE", message_id, "+FLAGS", "\\Deleted")
                 conn.expunge()
                 return True
             finally:
@@ -242,6 +251,14 @@ class ImapEmailService:
         """Remove star (flag) from a message."""
         return self._set_flag(message_id, "\\Flagged", add=False)
 
+    def mark_read(self, message_id: str) -> bool:
+        """Mark a message as read (set the \\Seen flag)."""
+        return self._set_flag(message_id, "\\Seen", add=True)
+
+    def mark_unread(self, message_id: str) -> bool:
+        """Mark a message as unread (clear the \\Seen flag)."""
+        return self._set_flag(message_id, "\\Seen", add=False)
+
     # -- Internal helpers -------------------------------------------------------
 
     def _set_flag(self, message_id: str, flag: str, *, add: bool) -> bool:
@@ -251,7 +268,7 @@ class ImapEmailService:
             try:
                 conn.select("INBOX")
                 op = "+FLAGS" if add else "-FLAGS"
-                status, _ = conn.store(message_id, op, flag)
+                status, _ = conn.uid("STORE", message_id, op, flag)
                 return status == "OK"
             finally:
                 try:
@@ -270,12 +287,12 @@ class ImapEmailService:
             smtp.send_message(msg)
 
     def _fetch_envelope(self, conn: imaplib.IMAP4, uid: bytes) -> EmailMessage | None:
-        """Fetch headers + snippet for a single message (lightweight)."""
-        status, data = conn.fetch(uid, "(RFC822.HEADER FLAGS BODY.PEEK[TEXT]<0.200>)")
+        """Fetch headers + snippet for a single message by UID (lightweight)."""
+        status, data = conn.uid("FETCH", uid, "(RFC822.HEADER FLAGS BODY.PEEK[TEXT]<0.200>)")
         if status != "OK" or not data or data[0] is None:
             return None
 
-        # data layout: [(b'UID FLAGS ...', header_bytes), (b'...', snippet_bytes), b')']
+        # data layout: [(b'<seq> (UID <uid> FLAGS ...', header_bytes), (b'...', snippet_bytes), b')']
         header_bytes = data[0][1]
         flags_data = data[0][0]
 
@@ -336,6 +353,11 @@ class ImapEmailService:
         body = self._extract_body(msg, max_body_chars)
         snippet = re.sub(r"\s+", " ", body[:150]).strip() if body else ""
 
+        unsubscribe_url, unsubscribe_mailto, unsubscribe_one_click = parse_unsubscribe_headers(
+            str(msg.get("List-Unsubscribe", "") or ""),
+            str(msg.get("List-Unsubscribe-Post", "") or ""),
+        )
+
         return EmailMessage(
             id=uid,
             thread_id=message_id_header,
@@ -346,6 +368,9 @@ class ImapEmailService:
             date=date,
             is_unread=is_unread,
             body=body,
+            unsubscribe_url=unsubscribe_url,
+            unsubscribe_mailto=unsubscribe_mailto,
+            unsubscribe_one_click=unsubscribe_one_click,
         )
 
     @staticmethod

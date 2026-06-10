@@ -1,7 +1,7 @@
 name: "email"
 display_name: "Email (Gmail & IMAP)"
 description: "Full email management — list, read, search, send, reply, archive, trash, and star. Supports Gmail (OAuth) and IMAP/SMTP (Proton Mail, Yahoo, etc.). Includes VIP alerts and daily digest agent."
-version: "1.0.0"
+version: "1.0.1"
 min_jarvis_version: "0.9.0"
 license: "MIT"
 author:
@@ -10,8 +10,21 @@ categories: ["communication", "email"]
 platforms: ["darwin", "linux"]
 keywords: ["email", "gmail", "imap", "inbox", "send", "reply", "archive"]
 
+# Declared components override directory inference — list ALL of them.
+components:
+  - type: command
+    name: email
+    path: commands/email/command.py
+  - type: agent
+    name: email_alerts
+    path: agents/email_alerts/agent.py
+  - type: agent
+    name: smart_reply
+    path: agents/smart_reply/agent.py
+
 packages:
   - name: httpx
+  - name: requests
 
 secrets:
   - key: EMAIL_PROVIDER
@@ -90,4 +103,9 @@ secrets:
     scope: integration
     value_type: int
     description: "Hour (0-23) for daily email digest (default: 7)"
+    is_sensitive: false
+  - key: EMAIL_NOTIFICATION_FILTER
+    scope: integration
+    value_type: string
+    description: "Free-text rule for which emails deserve a drafted reply (e.g. 'clients, invoices, anything from my kid's school'). Leave blank to disable smart replies."
     is_sensitive: false

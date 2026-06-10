@@ -24,6 +24,11 @@ def _stub_email_shared() -> None:
     esf.get_email_provider = lambda: "gmail"
     sys.modules["email_shared.email_service_factory"] = esf
 
+    tr = types.ModuleType("email_shared.triage")
+    tr.build_triage_payload = lambda emails: ({}, {})
+    tr.build_triage_body = lambda emails: ""
+    sys.modules["email_shared.triage"] = tr
+
 
 def _load_command():
     _stub_email_shared()
@@ -138,4 +143,9 @@ class TestFastPathPatterns:
             "email.archive_to",
             "email.trash",
             "email.star",
+            "email.unstar",
+            "email.mark_read",
+            "email.mark_unread",
+            "email.triage",
+            "email.unsubscribe_scan",
         }

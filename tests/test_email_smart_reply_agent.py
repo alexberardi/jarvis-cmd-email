@@ -1,0 +1,596 @@
+"""Smart-reply agent — fail-closed filter, draft parsing, persistent dedup, inbox post."""
+
+import asyncio
+import importlib.util
+import os
+import sys
+import types
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+
+from jarvis_command_sdk import set_backend, set_inbox_backend
+from jarvis_command_sdk.inbox import InboxBackend
+from jarvis_command_sdk.storage import StorageBackend
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.abspath(os.path.join(_HERE, ".."))
+
+
+def _load_real(name: str, *parts: str):
+    path = os.path.join(_ROOT, *parts)
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _stub_log_client() -> None:
+    """No-op logger so failure-path tests don't queue real log batches."""
+    stub = types.ModuleType("jarvis_log_client")
+
+    class _Logger:
+        def __init__(self, **kwargs): ...
+        def info(self, *args, **kwargs): ...
+        def warning(self, *args, **kwargs): ...
+        def error(self, *args, **kwargs): ...
+        def debug(self, *args, **kwargs): ...
+
+    stub.JarvisLogger = _Logger
+    sys.modules["jarvis_log_client"] = stub
+
+
+def _install_email_shared() -> None:
+    _stub_log_client()
+    if "email_shared" not in sys.modules:
+        sys.modules["email_shared"] = types.ModuleType("email_shared")
+    _load_real("email_shared.email_message", "email_shared", "email_message.py")
+    if "email_shared.email_service_factory" not in sys.modules:
+        esf = types.ModuleType("email_shared.email_service_factory")
+        esf.create_email_service = lambda: None
+        esf.get_email_provider = lambda: "gmail"
+        sys.modules["email_shared.email_service_factory"] = esf
+
+
+_install_email_shared()
+_agent_mod = _load_real(
+    "smart_reply_agent_under_test", "agents", "smart_reply", "agent.py"
+)
+
+
+def _make_email(idx: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=f"id-{idx}",
+        thread_id=f"thread-{idx}",
+        sender=f"Sender {idx} <sender{idx}@example.com>",
+        sender_name=f"Sender {idx}",
+        subject=f"Subject {idx}",
+        snippet=f"Snippet {idx}",
+        body=f"Body {idx}",
+    )
+
+
+def _install_fake_node_llm_client(monkeypatch, ask_llm_impl) -> None:
+    """Make `from services.node_llm_client import ask_llm` resolve to our fake."""
+    services_mod = sys.modules.get("services") or types.ModuleType("services")
+    monkeypatch.setitem(sys.modules, "services", services_mod)
+    node_mod = types.ModuleType("services.node_llm_client")
+    node_mod.ask_llm = ask_llm_impl  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "services.node_llm_client", node_mod)
+    services_mod.node_llm_client = node_mod  # type: ignore[attr-defined]
+
+
+def _staged_ask_llm(filter_response, draft_responses: list):
+    """Fake ask_llm dispatching on the system prompt: filter vs draft stage."""
+    drafts = list(draft_responses)
+
+    def fake_ask(prompt: str, *, system=None, **kw):
+        if system and "strict email filter" in system:
+            return filter_response
+        return drafts.pop(0) if drafts else None
+
+    return fake_ask
+
+
+class _FakeStorageBackend(StorageBackend):
+    """In-memory records (honoring expires_at) + secrets keyed by (key, scope)."""
+
+    def __init__(self) -> None:
+        self.records: dict[tuple[str, str], dict] = {}
+        self.expires: dict[tuple[str, str], datetime | None] = {}
+        self.secrets: dict[tuple[str, str], str] = {}
+
+    def save(self, command_name, data_key, data, expires_at=None) -> None:
+        self.records[(command_name, data_key)] = data
+        self.expires[(command_name, data_key)] = expires_at
+
+    def get(self, command_name, data_key):
+        key = (command_name, data_key)
+        if key not in self.records:
+            return None
+        exp = self.expires.get(key)
+        if exp is not None and exp <= datetime.now(timezone.utc):
+            return None
+        return self.records[key]
+
+    def get_all(self, command_name):
+        return [v for (c, _), v in self.records.items() if c == command_name]
+
+    def delete(self, command_name, data_key) -> bool:
+        return self.records.pop((command_name, data_key), None) is not None
+
+    def delete_all(self, command_name) -> int:
+        keys = [k for k in self.records if k[0] == command_name]
+        for k in keys:
+            del self.records[k]
+        return len(keys)
+
+    def get_secret(self, key, scope, user_id=None):
+        return self.secrets.get((key, scope))
+
+    def set_secret(self, key, value, scope, value_type="string", user_id=None) -> None:
+        self.secrets[(key, scope)] = value
+
+    def delete_secret(self, key, scope, user_id=None) -> None:
+        self.secrets.pop((key, scope), None)
+
+
+class _FakeInboxBackend(InboxBackend):
+    def __init__(self, tag: str = "ok") -> None:
+        self.tag = tag
+        self.calls: list[dict] = []
+
+    def post_inbox_item(self, command_name, **kwargs) -> str:
+        self.calls.append({"command_name": command_name, **kwargs})
+        return self.tag
+
+
+@pytest.fixture
+def storage_backend():
+    backend = _FakeStorageBackend()
+    backend.secrets[("GMAIL_ACCESS_TOKEN", "integration")] = "tok"
+    backend.secrets[("EMAIL_NOTIFICATION_FILTER", "integration")] = "clients and invoices"
+    set_backend(backend)
+    yield backend
+    set_backend(None)
+
+
+@pytest.fixture
+def inbox_backend():
+    backend = _FakeInboxBackend()
+    set_inbox_backend(backend)
+    yield backend
+    set_inbox_backend(None)
+
+
+@pytest.fixture
+def agent():
+    return _agent_mod.SmartReplyAgent()
+
+
+def _wire_service(monkeypatch, emails: list[SimpleNamespace]) -> MagicMock:
+    service = MagicMock()
+    service.search.return_value = emails
+    service.fetch_message.side_effect = lambda mid, max_body_chars=1000: next(
+        (e for e in emails if e.id == mid), None
+    )
+    monkeypatch.setattr(_agent_mod, "create_email_service", lambda: service)
+    return service
+
+
+def _run(agent) -> None:
+    asyncio.run(agent.run())
+
+
+_OK_DRAFT = '{"should_reply": true, "draft": "Sounds good — see you then."}'
+
+
+# ── Declaration ──────────────────────────────────────────────────────────────
+
+
+class TestDeclaration:
+    def test_schedule(self, agent):
+        schedule = agent.schedule
+        assert schedule.interval_seconds == 300
+        assert schedule.run_on_startup is False
+
+    def test_filter_secret_declared(self, agent):
+        secrets = {s.key: s for s in agent.required_secrets}
+        secret = secrets["EMAIL_NOTIFICATION_FILTER"]
+        assert secret.scope == "integration"
+        assert secret.required is False
+        assert secret.is_sensitive is False
+
+    def test_not_in_context(self, agent):
+        assert agent.include_in_context is False
+        assert agent.get_context_data() == {}
+        assert agent.get_alerts() == []
+
+
+# ── Filter (LLM call 1): fail-closed matrix ──────────────────────────────────
+
+
+class TestFilterEmails:
+    def test_no_emails_returns_empty(self, agent):
+        assert agent._filter_emails("clients", []) == []
+
+    def test_llm_unavailable_fails_closed(self, agent, monkeypatch):
+        monkeypatch.setitem(sys.modules, "services.node_llm_client", None)
+        result = agent._filter_emails("clients", [_make_email(1)])
+        assert result == []
+
+    def test_llm_returns_matching_indices(self, agent, monkeypatch):
+        emails = [_make_email(1), _make_email(2), _make_email(3)]
+        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: "[1, 3]")
+        matched = agent._filter_emails("clients", emails)
+        assert matched == [emails[0], emails[2]]
+
+    def test_llm_returns_empty_array(self, agent, monkeypatch):
+        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: "[]")
+        assert agent._filter_emails("clients", [_make_email(1)]) == []
+
+    def test_llm_returns_none_fails_closed(self, agent, monkeypatch):
+        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: None)
+        assert agent._filter_emails("clients", [_make_email(1)]) == []
+
+    def test_llm_returns_garbage_fails_closed(self, agent, monkeypatch):
+        _install_fake_node_llm_client(
+            monkeypatch, lambda *a, **kw: "Emails 1 and 2 look important."
+        )
+        assert agent._filter_emails("clients", [_make_email(1), _make_email(2)]) == []
+
+    def test_llm_strips_think_block_and_code_fence(self, agent, monkeypatch):
+        emails = [_make_email(1), _make_email(2), _make_email(3)]
+        raw = "<think>let me reason</think>\n```json\n[2]\n```"
+        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: raw)
+        matched = agent._filter_emails("rule", emails)
+        assert matched == [emails[1]]
+
+    def test_llm_out_of_range_indices_dropped(self, agent, monkeypatch):
+        emails = [_make_email(1), _make_email(2)]
+        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: "[1, 5, 99, 0, -1]")
+        matched = agent._filter_emails("rule", emails)
+        assert matched == [emails[0]]
+
+    def test_llm_non_numeric_indices_dropped(self, agent, monkeypatch):
+        emails = [_make_email(1), _make_email(2)]
+        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: '["foo", 2]')
+        matched = agent._filter_emails("rule", emails)
+        assert matched == [emails[1]]
+
+    def test_prompt_contains_strict_guidance_and_email_lines(self, agent, monkeypatch):
+        captured: dict[str, Any] = {}
+
+        def fake_ask(prompt: str, *, system=None, **kw):
+            captured["prompt"] = prompt
+            captured["system"] = system
+            return "[]"
+
+        _install_fake_node_llm_client(monkeypatch, fake_ask)
+        agent._filter_emails("only client mail", [_make_email(1)])
+
+        assert "HARD" in captured["system"]
+        assert "skip" in captured["system"].lower()
+        assert "false positive" in captured["system"].lower()
+        assert "only client mail" in captured["prompt"]
+        # Contract format: "{i}. From: {sender}\n   Subject: {subject}\n   {snippet}"
+        assert (
+            "1. From: Sender 1 <sender1@example.com>\n"
+            "   Subject: Subject 1\n"
+            "   Snippet 1"
+        ) in captured["prompt"]
+
+
+# ── Draft generation (LLM call 2): JSON parsing ──────────────────────────────
+
+
+class TestGenerateDraft:
+    def test_valid_draft(self, agent, monkeypatch):
+        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: _OK_DRAFT)
+        status, draft = agent._generate_draft(_make_email(1))
+        assert status == "ok"
+        assert draft == "Sounds good — see you then."
+
+    def test_should_reply_false(self, agent, monkeypatch):
+        _install_fake_node_llm_client(
+            monkeypatch, lambda *a, **kw: '{"should_reply": false, "draft": ""}'
+        )
+        assert agent._generate_draft(_make_email(1)) == ("no_reply", "")
+
+    def test_code_fences_stripped(self, agent, monkeypatch):
+        raw = '```json\n{"should_reply": true, "draft": "Yes."}\n```'
+        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: raw)
+        assert agent._generate_draft(_make_email(1)) == ("ok", "Yes.")
+
+    def test_think_tags_stripped(self, agent, monkeypatch):
+        raw = '<think>reasoning...</think>{"should_reply": true, "draft": "Yes."}'
+        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: raw)
+        assert agent._generate_draft(_make_email(1)) == ("ok", "Yes.")
+
+    def test_garbage_is_parse_fail(self, agent, monkeypatch):
+        _install_fake_node_llm_client(
+            monkeypatch, lambda *a, **kw: "Sure! Here's a draft: hello"
+        )
+        assert agent._generate_draft(_make_email(1)) == ("parse_fail", "")
+
+    def test_should_reply_true_without_draft_is_parse_fail(self, agent, monkeypatch):
+        _install_fake_node_llm_client(
+            monkeypatch, lambda *a, **kw: '{"should_reply": true, "draft": ""}'
+        )
+        assert agent._generate_draft(_make_email(1)) == ("parse_fail", "")
+
+    def test_empty_response_is_no_llm(self, agent, monkeypatch):
+        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: None)
+        assert agent._generate_draft(_make_email(1)) == ("no_llm", "")
+
+    def test_llm_unavailable_is_no_llm(self, agent, monkeypatch):
+        monkeypatch.setitem(sys.modules, "services.node_llm_client", None)
+        assert agent._generate_draft(_make_email(1)) == ("no_llm", "")
+
+    def test_prompt_carries_full_body(self, agent, monkeypatch):
+        captured: dict[str, Any] = {}
+
+        def fake_ask(prompt: str, *, system=None, **kw):
+            captured["prompt"] = prompt
+            captured["system"] = system
+            return _OK_DRAFT
+
+        _install_fake_node_llm_client(monkeypatch, fake_ask)
+        agent._generate_draft(_make_email(1))
+
+        assert "Body 1" in captured["prompt"]
+        assert "should_reply" in captured["system"]
+        assert "150 words" in captured["system"]
+
+
+# ── run(): gates, cap, post shape, dedup interplay ───────────────────────────
+
+
+class TestRunFlow:
+    def test_off_when_filter_empty(self, agent, storage_backend, inbox_backend, monkeypatch):
+        del storage_backend.secrets[("EMAIL_NOTIFICATION_FILTER", "integration")]
+        create = MagicMock()
+        monkeypatch.setattr(_agent_mod, "create_email_service", create)
+
+        _run(agent)
+
+        create.assert_not_called()
+        assert inbox_backend.calls == []
+
+    def test_off_when_filter_whitespace(self, agent, storage_backend, inbox_backend, monkeypatch):
+        storage_backend.secrets[("EMAIL_NOTIFICATION_FILTER", "integration")] = "   "
+        create = MagicMock()
+        monkeypatch.setattr(_agent_mod, "create_email_service", create)
+
+        _run(agent)
+        create.assert_not_called()
+
+    def test_missing_credentials_returns_early(self, agent, storage_backend, inbox_backend, monkeypatch):
+        del storage_backend.secrets[("GMAIL_ACCESS_TOKEN", "integration")]
+        create = MagicMock()
+        monkeypatch.setattr(_agent_mod, "create_email_service", create)
+
+        _run(agent)
+        create.assert_not_called()
+
+    def test_happy_path_posts_draft(self, agent, storage_backend, inbox_backend, monkeypatch):
+        emails = [_make_email(1), _make_email(2)]
+        service = _wire_service(monkeypatch, emails)
+        _install_fake_node_llm_client(monkeypatch, _staged_ask_llm("[1]", [_OK_DRAFT]))
+
+        _run(agent)
+
+        service.search.assert_called_once_with(
+            "is:unread in:inbox newer_than:1d", max_results=20
+        )
+        service.fetch_message.assert_called_once_with("id-1", max_body_chars=3000)
+        assert len(inbox_backend.calls) == 1
+        # Posted id is persistently marked drafted
+        assert storage_backend.get("email_smart_reply", "id-1") is not None
+        assert storage_backend.get("email_smart_reply", "id-2") is None
+
+    def test_post_shape(self, agent, storage_backend, inbox_backend, monkeypatch):
+        _wire_service(monkeypatch, [_make_email(1)])
+        _install_fake_node_llm_client(monkeypatch, _staged_ask_llm("[1]", [_OK_DRAFT]))
+
+        _run(agent)
+
+        call = inbox_backend.calls[0]
+        assert call["command_name"] == "email"
+        assert call["title"] == "Reply ready — Sender 1"
+        assert call["summary"] == "Subject 1"
+        assert call["body"] == (
+            "From: Sender 1 <sender1@example.com>\n"
+            "Subject: Subject 1\n\n"
+            "Snippet 1\n\n"
+            "— Draft reply —\n\n"
+            "Sounds good — see you then."
+        )
+        assert call["category"] == "smart_reply"
+        assert call["user_id"] is None
+        assert call["target_type"] == "household"
+        assert call["create_push_notification"] is True
+
+        elements = call["metadata"]["interactive_elements"]
+        assert elements == [
+            {
+                "id": "send-id-1",
+                "label": "Send reply",
+                "kind": "send",
+                "command": "email",
+                "callback": "send_draft_reply",
+                "data": {
+                    "message_id": "id-1",
+                    "thread_id": "thread-1",
+                    "body": "Sounds good — see you then.",
+                },
+                "navigation_type": "stack",
+            },
+            {
+                "id": "ignore-id-1",
+                "label": "Ignore",
+                "command": "email",
+                "callback": "dismiss_draft",
+                "data": {"message_id": "id-1"},
+            },
+        ]
+
+    def test_max_two_posts_per_run(self, agent, storage_backend, inbox_backend, monkeypatch):
+        emails = [_make_email(i) for i in range(1, 5)]
+        service = _wire_service(monkeypatch, emails)
+        _install_fake_node_llm_client(
+            monkeypatch, _staged_ask_llm("[1, 2, 3, 4]", [_OK_DRAFT] * 4)
+        )
+
+        _run(agent)
+
+        assert len(inbox_backend.calls) == 2
+        assert service.fetch_message.call_count == 2  # matches capped before fetch
+        assert storage_backend.get("email_smart_reply", "id-1") is not None
+        assert storage_backend.get("email_smart_reply", "id-2") is not None
+        assert storage_backend.get("email_smart_reply", "id-3") is None
+
+    def test_already_drafted_ids_dropped_before_filter(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        emails = [_make_email(1), _make_email(2)]
+        _wire_service(monkeypatch, emails)
+        agent._mark_drafted("id-1")
+
+        captured: dict[str, Any] = {}
+
+        def fake_ask(prompt: str, *, system=None, **kw):
+            if system and "strict email filter" in system:
+                captured["prompt"] = prompt
+                return "[1]"
+            return _OK_DRAFT
+
+        _install_fake_node_llm_client(monkeypatch, fake_ask)
+
+        _run(agent)
+
+        # id-1 never reached the filter; index 1 now refers to id-2
+        assert "Subject 1" not in captured["prompt"]
+        assert "Subject 2" in captured["prompt"]
+        assert len(inbox_backend.calls) == 1
+        assert inbox_backend.calls[0]["title"] == "Reply ready — Sender 2"
+
+    def test_all_drafted_skips_llm_entirely(self, agent, storage_backend, inbox_backend, monkeypatch):
+        emails = [_make_email(1)]
+        _wire_service(monkeypatch, emails)
+        agent._mark_drafted("id-1")
+        ask = MagicMock()
+        _install_fake_node_llm_client(monkeypatch, ask)
+
+        _run(agent)
+
+        ask.assert_not_called()
+        assert inbox_backend.calls == []
+
+    def test_draft_parse_fail_marks_drafted_no_post(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        _wire_service(monkeypatch, [_make_email(1)])
+        _install_fake_node_llm_client(monkeypatch, _staged_ask_llm("[1]", ["garbage"]))
+
+        _run(agent)
+
+        assert inbox_backend.calls == []
+        assert storage_backend.get("email_smart_reply", "id-1") is not None
+
+    def test_should_reply_false_marks_drafted_no_post(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        _wire_service(monkeypatch, [_make_email(1)])
+        _install_fake_node_llm_client(
+            monkeypatch,
+            _staged_ask_llm("[1]", ['{"should_reply": false, "draft": ""}']),
+        )
+
+        _run(agent)
+
+        assert inbox_backend.calls == []
+        assert storage_backend.get("email_smart_reply", "id-1") is not None
+
+    def test_llm_unreachable_at_draft_stage_does_not_mark(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        _wire_service(monkeypatch, [_make_email(1)])
+        _install_fake_node_llm_client(monkeypatch, _staged_ask_llm("[1]", [None]))
+
+        _run(agent)
+
+        assert inbox_backend.calls == []
+        # Transient — must retry next run
+        assert storage_backend.get("email_smart_reply", "id-1") is None
+
+    def test_post_failure_does_not_mark_drafted(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        inbox_backend.tag = "http_error"
+        _wire_service(monkeypatch, [_make_email(1)])
+        _install_fake_node_llm_client(monkeypatch, _staged_ask_llm("[1]", [_OK_DRAFT]))
+
+        _run(agent)
+
+        assert len(inbox_backend.calls) == 1
+        assert storage_backend.get("email_smart_reply", "id-1") is None
+
+    def test_filter_fail_closed_no_posts(self, agent, storage_backend, inbox_backend, monkeypatch):
+        _wire_service(monkeypatch, [_make_email(1)])
+        _install_fake_node_llm_client(monkeypatch, _staged_ask_llm(None, []))
+
+        _run(agent)
+        assert inbox_backend.calls == []
+
+    def test_service_construction_failure_swallowed(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        def boom():
+            raise ValueError("not configured")
+
+        monkeypatch.setattr(_agent_mod, "create_email_service", boom)
+        _run(agent)  # must not raise
+        assert inbox_backend.calls == []
+
+
+# ── Persistent dedup ─────────────────────────────────────────────────────────
+
+
+class TestPersistentDedup:
+    def test_mark_and_check(self, agent, storage_backend):
+        assert agent._already_drafted("id-1") is False
+        agent._mark_drafted("id-1")
+        assert agent._already_drafted("id-1") is True
+
+    def test_record_shape_and_ttl(self, agent, storage_backend):
+        before = datetime.now(timezone.utc)
+        agent._mark_drafted("id-1")
+        after = datetime.now(timezone.utc)
+
+        record = storage_backend.records[("email_smart_reply", "id-1")]
+        drafted_at = datetime.fromisoformat(record["drafted_at"])
+        assert before <= drafted_at <= after
+
+        expires_at = storage_backend.expires[("email_smart_reply", "id-1")]
+        assert before + timedelta(days=7) <= expires_at <= after + timedelta(days=7)
+
+    def test_survives_restart(self, agent, storage_backend):
+        agent._mark_drafted("id-1")
+        fresh_agent = _agent_mod.SmartReplyAgent()
+        assert fresh_agent._already_drafted("id-1") is True
+
+    def test_expired_record_means_not_drafted(self, agent, storage_backend):
+        key = ("email_smart_reply", "id-1")
+        storage_backend.records[key] = {"drafted_at": "2026-01-01T00:00:00+00:00"}
+        storage_backend.expires[key] = datetime.now(timezone.utc) - timedelta(days=1)
+        assert agent._already_drafted("id-1") is False
+
+    def test_no_backend_never_drafted(self, agent):
+        # Facade returns None without a backend — agent treats as not drafted
+        assert agent._already_drafted("id-1") is False
+        agent._mark_drafted("id-1")  # no-op, must not raise

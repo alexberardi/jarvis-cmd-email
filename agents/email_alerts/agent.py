@@ -20,10 +20,20 @@ except ImportError:
     import logging
     logger = logging.getLogger("jarvis-cmd-email")
 
-from jarvis_command_sdk import AgentSchedule, Alert, IJarvisAgent, IJarvisSecret, JarvisSecret, JarvisStorage
+from jarvis_command_sdk import (
+    AgentSchedule,
+    Alert,
+    IJarvisAgent,
+    IJarvisSecret,
+    InteractiveList,
+    JarvisInbox,
+    JarvisSecret,
+    JarvisStorage,
+)
 
 from email_shared.email_message import extract_email
 from email_shared.email_service_factory import create_email_service, get_email_provider
+from email_shared.triage import build_triage_body, build_triage_payload
 
 _storage = JarvisStorage("email_alerts")
 
@@ -251,7 +261,13 @@ class EmailAlertAgent(IJarvisAgent):
     def _check_digest(
         self, emails: list[Any], digest_hour: int, now: datetime
     ) -> List[Alert]:
-        """Generate a daily digest alert during the morning window."""
+        """Post the daily digest as an interactive triage list during the morning window.
+
+        The digest is the same triage payload the email command's 'triage'
+        action builds (shared via email_shared.triage). When the inbox post
+        fails, falls back to the legacy text Alert so the digest never
+        silently disappears.
+        """
         if not emails:
             return []
 
@@ -265,23 +281,44 @@ class EmailAlertAgent(IJarvisAgent):
 
         self._last_digest_date = today
 
-        # Count emails per sender
-        sender_counts: Counter[str] = Counter()
-        for email in emails:
-            sender_counts[email.sender_name] += 1
+        metadata, _context = build_triage_payload(emails)
+        tag = JarvisInbox("email").post(
+            title=f"Daily email digest — {len(emails)} unread",
+            summary=self._build_digest_summary(emails),
+            body=build_triage_body(emails),
+            category=InteractiveList.CATEGORY,
+            metadata=metadata,
+            user_id=None,
+            create_push_notification=True,
+            target_type="household",
+        )
+        if tag == "ok":
+            logger.info("Daily email digest posted as triage list", unread=len(emails))
+            return []
 
-        # Top 3 senders
-        top_senders = sender_counts.most_common(3)
-        top_str = ", ".join(f"{name} ({count})" for name, count in top_senders)
-
+        # Post failed — fall back to the legacy text digest Alert.
+        logger.warning(
+            "Daily digest inbox post failed — falling back to text alert", reason=tag
+        )
         return [Alert(
             source_agent=self.name,
             title="Daily Email Digest",
-            summary=f"{len(emails)} unread emails. Top senders: {top_str}",
+            summary=self._build_digest_summary(emails),
             created_at=now,
             expires_at=now + timedelta(hours=ALERT_TTL_HOURS),
             priority=1,
         )]
+
+    @staticmethod
+    def _build_digest_summary(emails: list[Any]) -> str:
+        """Unread count + top-3 senders line shared by the inbox post and the fallback Alert."""
+        sender_counts: Counter[str] = Counter()
+        for email in emails:
+            sender_counts[email.sender_name] += 1
+
+        top_senders = sender_counts.most_common(3)
+        top_str = ", ".join(f"{name} ({count})" for name, count in top_senders)
+        return f"{len(emails)} unread emails. Top senders: {top_str}"
 
     def _apply_rate_limit(self, alerts: List[Alert]) -> List[Alert]:
         """Cap alerts per run, keeping highest priority first."""
