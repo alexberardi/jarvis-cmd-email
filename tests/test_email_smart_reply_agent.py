@@ -49,6 +49,7 @@ def _install_email_shared() -> None:
     if "email_shared" not in sys.modules:
         sys.modules["email_shared"] = types.ModuleType("email_shared")
     _load_real("email_shared.email_message", "email_shared", "email_message.py")
+    _load_real("email_shared.user_resolution", "email_shared", "user_resolution.py")
     if "email_shared.email_service_factory" not in sys.modules:
         esf = types.ModuleType("email_shared.email_service_factory")
         esf.create_email_service = lambda: None
@@ -165,6 +166,20 @@ def inbox_backend():
     set_inbox_backend(backend)
     yield backend
     set_inbox_backend(None)
+
+
+@pytest.fixture(autouse=True)
+def one_configured_user(monkeypatch):
+    """Default: one mailbox-configured user (uid 1). Tests override as needed."""
+    monkeypatch.setattr(_agent_mod, "find_configured_user_ids", lambda: [1])
+
+
+@pytest.fixture
+def context_calls(monkeypatch):
+    """Record every set_current_user_id call the agent makes."""
+    calls: list[int | None] = []
+    monkeypatch.setattr(_agent_mod, "set_current_user_id", calls.append)
+    return calls
 
 
 @pytest.fixture
@@ -369,13 +384,14 @@ class TestRunFlow:
         _run(agent)
         create.assert_not_called()
 
-    def test_missing_credentials_returns_early(self, agent, storage_backend, inbox_backend, monkeypatch):
-        del storage_backend.secrets[("GMAIL_ACCESS_TOKEN", "integration")]
+    def test_zero_configured_users_is_noop(self, agent, storage_backend, inbox_backend, monkeypatch):
+        monkeypatch.setattr(_agent_mod, "find_configured_user_ids", lambda: [])
         create = MagicMock()
         monkeypatch.setattr(_agent_mod, "create_email_service", create)
 
         _run(agent)
         create.assert_not_called()
+        assert inbox_backend.calls == []
 
     def test_happy_path_posts_draft(self, agent, storage_backend, inbox_backend, monkeypatch):
         emails = [_make_email(1), _make_email(2)]
@@ -389,9 +405,9 @@ class TestRunFlow:
         )
         service.fetch_message.assert_called_once_with("id-1", max_body_chars=3000)
         assert len(inbox_backend.calls) == 1
-        # Posted id is persistently marked drafted
-        assert storage_backend.get("email_smart_reply", "id-1") is not None
-        assert storage_backend.get("email_smart_reply", "id-2") is None
+        # Posted id is persistently marked drafted, keyed per-user
+        assert storage_backend.get("email_smart_reply", "1:id-1") is not None
+        assert storage_backend.get("email_smart_reply", "1:id-2") is None
 
     def test_post_shape(self, agent, storage_backend, inbox_backend, monkeypatch):
         _wire_service(monkeypatch, [_make_email(1)])
@@ -411,8 +427,8 @@ class TestRunFlow:
             "Sounds good — see you then."
         )
         assert call["category"] == "smart_reply"
-        assert call["user_id"] is None
-        assert call["target_type"] == "household"
+        assert call["user_id"] == 1
+        assert call["target_type"] == "user"
         assert call["create_push_notification"] is True
 
         elements = call["metadata"]["interactive_elements"]
@@ -450,16 +466,16 @@ class TestRunFlow:
 
         assert len(inbox_backend.calls) == 2
         assert service.fetch_message.call_count == 2  # matches capped before fetch
-        assert storage_backend.get("email_smart_reply", "id-1") is not None
-        assert storage_backend.get("email_smart_reply", "id-2") is not None
-        assert storage_backend.get("email_smart_reply", "id-3") is None
+        assert storage_backend.get("email_smart_reply", "1:id-1") is not None
+        assert storage_backend.get("email_smart_reply", "1:id-2") is not None
+        assert storage_backend.get("email_smart_reply", "1:id-3") is None
 
     def test_already_drafted_ids_dropped_before_filter(
         self, agent, storage_backend, inbox_backend, monkeypatch
     ):
         emails = [_make_email(1), _make_email(2)]
         _wire_service(monkeypatch, emails)
-        agent._mark_drafted("id-1")
+        agent._mark_drafted(1, "id-1")
 
         captured: dict[str, Any] = {}
 
@@ -482,7 +498,7 @@ class TestRunFlow:
     def test_all_drafted_skips_llm_entirely(self, agent, storage_backend, inbox_backend, monkeypatch):
         emails = [_make_email(1)]
         _wire_service(monkeypatch, emails)
-        agent._mark_drafted("id-1")
+        agent._mark_drafted(1, "id-1")
         ask = MagicMock()
         _install_fake_node_llm_client(monkeypatch, ask)
 
@@ -500,7 +516,7 @@ class TestRunFlow:
         _run(agent)
 
         assert inbox_backend.calls == []
-        assert storage_backend.get("email_smart_reply", "id-1") is not None
+        assert storage_backend.get("email_smart_reply", "1:id-1") is not None
 
     def test_should_reply_false_marks_drafted_no_post(
         self, agent, storage_backend, inbox_backend, monkeypatch
@@ -514,7 +530,7 @@ class TestRunFlow:
         _run(agent)
 
         assert inbox_backend.calls == []
-        assert storage_backend.get("email_smart_reply", "id-1") is not None
+        assert storage_backend.get("email_smart_reply", "1:id-1") is not None
 
     def test_llm_unreachable_at_draft_stage_does_not_mark(
         self, agent, storage_backend, inbox_backend, monkeypatch
@@ -526,7 +542,7 @@ class TestRunFlow:
 
         assert inbox_backend.calls == []
         # Transient — must retry next run
-        assert storage_backend.get("email_smart_reply", "id-1") is None
+        assert storage_backend.get("email_smart_reply", "1:id-1") is None
 
     def test_post_failure_does_not_mark_drafted(
         self, agent, storage_backend, inbox_backend, monkeypatch
@@ -538,7 +554,7 @@ class TestRunFlow:
         _run(agent)
 
         assert len(inbox_backend.calls) == 1
-        assert storage_backend.get("email_smart_reply", "id-1") is None
+        assert storage_backend.get("email_smart_reply", "1:id-1") is None
 
     def test_filter_fail_closed_no_posts(self, agent, storage_backend, inbox_backend, monkeypatch):
         _wire_service(monkeypatch, [_make_email(1)])
@@ -563,34 +579,140 @@ class TestRunFlow:
 
 class TestPersistentDedup:
     def test_mark_and_check(self, agent, storage_backend):
-        assert agent._already_drafted("id-1") is False
-        agent._mark_drafted("id-1")
-        assert agent._already_drafted("id-1") is True
+        assert agent._already_drafted(1, "id-1") is False
+        agent._mark_drafted(1, "id-1")
+        assert agent._already_drafted(1, "id-1") is True
+
+    def test_dedup_is_per_user(self, agent, storage_backend):
+        agent._mark_drafted(1, "id-1")
+        assert agent._already_drafted(1, "id-1") is True
+        # Same message id for another user is NOT drafted
+        assert agent._already_drafted(2, "id-1") is False
 
     def test_record_shape_and_ttl(self, agent, storage_backend):
         before = datetime.now(timezone.utc)
-        agent._mark_drafted("id-1")
+        agent._mark_drafted(1, "id-1")
         after = datetime.now(timezone.utc)
 
-        record = storage_backend.records[("email_smart_reply", "id-1")]
+        record = storage_backend.records[("email_smart_reply", "1:id-1")]
         drafted_at = datetime.fromisoformat(record["drafted_at"])
         assert before <= drafted_at <= after
 
-        expires_at = storage_backend.expires[("email_smart_reply", "id-1")]
+        expires_at = storage_backend.expires[("email_smart_reply", "1:id-1")]
         assert before + timedelta(days=7) <= expires_at <= after + timedelta(days=7)
 
     def test_survives_restart(self, agent, storage_backend):
-        agent._mark_drafted("id-1")
+        agent._mark_drafted(1, "id-1")
         fresh_agent = _agent_mod.SmartReplyAgent()
-        assert fresh_agent._already_drafted("id-1") is True
+        assert fresh_agent._already_drafted(1, "id-1") is True
 
     def test_expired_record_means_not_drafted(self, agent, storage_backend):
-        key = ("email_smart_reply", "id-1")
+        key = ("email_smart_reply", "1:id-1")
         storage_backend.records[key] = {"drafted_at": "2026-01-01T00:00:00+00:00"}
         storage_backend.expires[key] = datetime.now(timezone.utc) - timedelta(days=1)
-        assert agent._already_drafted("id-1") is False
+        assert agent._already_drafted(1, "id-1") is False
 
     def test_no_backend_never_drafted(self, agent):
         # Facade returns None without a backend — agent treats as not drafted
-        assert agent._already_drafted("id-1") is False
-        agent._mark_drafted("id-1")  # no-op, must not raise
+        assert agent._already_drafted(1, "id-1") is False
+        agent._mark_drafted(1, "id-1")  # no-op, must not raise
+
+
+# ── Discovery context: validate_secrets via node-side user enumeration ───────
+
+
+class TestValidateSecretsDiscovery:
+    def test_passes_with_a_configured_user(self, agent, monkeypatch):
+        # No storage backend, no ContextVar user — a configured user found
+        # node-side is enough for the agent to surface at discovery.
+        monkeypatch.setattr(_agent_mod, "find_configured_user_ids", lambda: [3])
+        assert agent.validate_secrets() == []
+
+    def test_fails_with_no_users_gmail_branch(self, agent, monkeypatch):
+        monkeypatch.setattr(_agent_mod, "find_configured_user_ids", lambda: [])
+        monkeypatch.setattr(_agent_mod, "get_email_provider", lambda: "gmail")
+        assert agent.validate_secrets() == ["GMAIL_ACCESS_TOKEN"]
+
+    @pytest.mark.parametrize("provider", ["proton", "yahoo", "outlook", "fastmail", "imap"])
+    def test_fails_with_no_users_imap_branch(self, agent, monkeypatch, provider):
+        # Every non-gmail provider (IMAP presets included) must report the
+        # IMAP creds, never GMAIL_ACCESS_TOKEN.
+        monkeypatch.setattr(_agent_mod, "find_configured_user_ids", lambda: [])
+        monkeypatch.setattr(_agent_mod, "get_email_provider", lambda: provider)
+        assert agent.validate_secrets() == ["IMAP_USERNAME", "IMAP_PASSWORD"]
+
+
+# ── Per-user execution: ContextVar lifecycle, user-targeted posts, caps ──────
+
+
+class TestPerUserRun:
+    def test_context_var_set_then_reset(
+        self, agent, storage_backend, inbox_backend, context_calls, monkeypatch
+    ):
+        _wire_service(monkeypatch, [_make_email(1)])
+        _install_fake_node_llm_client(monkeypatch, _staged_ask_llm("[1]", [_OK_DRAFT]))
+
+        _run(agent)
+
+        assert context_calls == [1, None]
+
+    def test_context_var_reset_even_when_user_flow_raises(
+        self, agent, storage_backend, inbox_backend, context_calls, monkeypatch
+    ):
+        def boom(uid, filter_text, budget):
+            raise RuntimeError("mailbox exploded")
+
+        monkeypatch.setattr(agent, "_run_for_user", boom)
+
+        _run(agent)  # outer try swallows; must not raise
+
+        assert context_calls == [1, None]
+
+    def test_posts_are_user_targeted_per_user(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        monkeypatch.setattr(_agent_mod, "find_configured_user_ids", lambda: [1, 2])
+        _wire_service(monkeypatch, [_make_email(1)])
+        # Each user's filter pass matches the single email; one draft each.
+        _install_fake_node_llm_client(
+            monkeypatch, _staged_ask_llm("[1]", [_OK_DRAFT] * 2)
+        )
+
+        _run(agent)
+
+        assert [(c["user_id"], c["target_type"]) for c in inbox_backend.calls] == [
+            (1, "user"),
+            (2, "user"),
+        ]
+        # Dedup keys are uid-prefixed — one per user for the same message id
+        assert storage_backend.get("email_smart_reply", "1:id-1") is not None
+        assert storage_backend.get("email_smart_reply", "2:id-1") is not None
+
+    def test_draft_cap_is_global_across_users(
+        self, agent, storage_backend, inbox_backend, context_calls, monkeypatch
+    ):
+        monkeypatch.setattr(_agent_mod, "find_configured_user_ids", lambda: [1, 2])
+        _wire_service(monkeypatch, [_make_email(i) for i in range(1, 5)])
+        _install_fake_node_llm_client(
+            monkeypatch, _staged_ask_llm("[1, 2, 3, 4]", [_OK_DRAFT] * 4)
+        )
+
+        _run(agent)
+
+        # User 1 exhausts MAX_DRAFTS_PER_RUN; user 2 is never entered.
+        assert len(inbox_backend.calls) == 2
+        assert all(c["user_id"] == 1 for c in inbox_backend.calls)
+        assert context_calls == [1, None]
+
+    def test_users_capped_at_five_per_run(
+        self, agent, storage_backend, inbox_backend, context_calls, monkeypatch
+    ):
+        monkeypatch.setattr(
+            _agent_mod, "find_configured_user_ids", lambda: [1, 2, 3, 4, 5, 6, 7]
+        )
+        _wire_service(monkeypatch, [])  # no mail — every user is a quick no-op
+
+        _run(agent)
+
+        visited = [c for c in context_calls if c is not None]
+        assert visited == [1, 2, 3, 4, 5]

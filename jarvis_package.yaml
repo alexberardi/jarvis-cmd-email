@@ -1,7 +1,7 @@
 name: "email"
 display_name: "Email (Gmail & IMAP)"
 description: "Full email management — list, read, search, send, reply, archive, trash, and star. Supports Gmail (OAuth) and IMAP/SMTP (Proton Mail, Yahoo, etc.). Includes VIP alerts and daily digest agent."
-version: "1.0.1"
+version: "1.0.2"
 min_jarvis_version: "0.9.0"
 license: "MIT"
 author:

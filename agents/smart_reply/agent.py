@@ -1,7 +1,10 @@
 """SmartReplyAgent — LLM-drafted replies for important unread email.
 
 Runs every 5 minutes. The whole feature is OFF until the user sets the
-EMAIL_NOTIFICATION_FILTER secret (their free-text importance rule). Each run:
+EMAIL_NOTIFICATION_FILTER secret (their free-text importance rule). Each run
+iterates the mailbox-configured users (mailbox secrets are user-scoped, and
+agents have no ambient user — see email_shared.user_resolution) and, with the
+SDK user ContextVar set to each user in turn:
 
 1. Search unread inbox mail from the last day, drop already-drafted ids.
 2. LLM call 1 — strict indices filter (fail-closed, same discipline as the
@@ -13,9 +16,9 @@ EMAIL_NOTIFICATION_FILTER secret (their free-text importance rule). Each run:
    dismiss_draft callbacks. Nothing is ever auto-sent — the tap IS the
    confirmation, with the draft on screen.
 
-Dedup is PERSISTENT: JarvisStorage records keyed by message id with a 7-day
-TTL, so drafts survive restarts. (The alerts agent's in-memory dedup
-re-alerts after a restart; a duplicate draft push would be far worse.)
+Dedup is PERSISTENT: JarvisStorage records keyed by "{user_id}:{message_id}"
+with a 7-day TTL, so drafts survive restarts. (The alerts agent's in-memory
+dedup re-alerts after a restart; a duplicate draft push would be far worse.)
 """
 
 import json
@@ -37,9 +40,11 @@ from jarvis_command_sdk import (
     JarvisInbox,
     JarvisSecret,
     JarvisStorage,
+    set_current_user_id,
 )
 
 from email_shared.email_service_factory import create_email_service, get_email_provider
+from email_shared.user_resolution import find_configured_user_ids
 
 # Records (drafted-id dedup) live under this namespace; secret reads are
 # global by (key, scope) so the same facade serves both.
@@ -48,7 +53,8 @@ _storage = JarvisStorage("email_smart_reply")
 REFRESH_INTERVAL_SECONDS = 300  # 5 minutes
 SEARCH_QUERY = "is:unread in:inbox newer_than:1d"
 SEARCH_MAX_RESULTS = 20
-MAX_DRAFTS_PER_RUN = 2
+MAX_DRAFTS_PER_RUN = 2  # global cap across all users per run
+MAX_USERS_PER_RUN = 5
 DRAFT_BODY_CHARS = 3000
 DEDUP_TTL_DAYS = 7
 CATEGORY = "smart_reply"  # unknown to mobile → InboxDetail fallback (body + elements)
@@ -112,9 +118,20 @@ class SmartReplyAgent(IJarvisAgent):
         ]
 
     def validate_secrets(self) -> List[str]:
-        """Agent requires email credentials to function."""
+        """Agent requires at least one user with usable email credentials.
+
+        Mailbox secrets are user-scoped and agent discovery runs with no
+        ambient user in the SDK ContextVar, so enumerate configured users
+        node-side instead of relying on ContextVar-resolved reads (which
+        always return None in this context).
+        """
+        if find_configured_user_ids():
+            return []
+        # No configured user (or not on a node) — report the missing creds
+        # for the ambient provider, matching email_service_factory's branch:
+        # every non-gmail provider uses the IMAP/SMTP code path.
         provider = get_email_provider()
-        if provider == "imap":
+        if provider != "gmail":
             missing: list[str] = []
             if not _storage.get_secret("IMAP_USERNAME"):
                 missing.append("IMAP_USERNAME")
@@ -131,62 +148,84 @@ class SmartReplyAgent(IJarvisAgent):
         return False
 
     async def run(self) -> None:
-        """Filter unread email and post draft replies to the inbox."""
+        """Filter unread email and post draft replies, per configured user."""
         try:
-            missing = self.validate_secrets()
-            if missing:
+            user_ids = find_configured_user_ids()
+            if not user_ids:
+                logger.debug("Smart reply agent: no users with a configured mailbox")
                 return
 
             filter_text = self._read_filter()
             if not filter_text:
                 return  # feature is OFF until the user writes a rule
 
-            try:
-                service = create_email_service()
-            except ValueError:
-                return
-
-            emails = service.search(SEARCH_QUERY, max_results=SEARCH_MAX_RESULTS)
-            candidates = [e for e in emails if not self._already_drafted(e.id)]
-            if not candidates:
-                return
-
-            matched = self._filter_emails(filter_text, candidates)[:MAX_DRAFTS_PER_RUN]
-
             posted = 0
-            for email in matched:
+            for uid in user_ids[:MAX_USERS_PER_RUN]:
                 if posted >= MAX_DRAFTS_PER_RUN:
-                    break
-                full = service.fetch_message(email.id, max_body_chars=DRAFT_BODY_CHARS)
-                if not full:
-                    continue  # transient fetch failure — retry next run
-                status, draft = self._generate_draft(full)
-                if status == "no_llm":
-                    # LLM unreachable — fail closed for the rest of this run,
-                    # retry on the next one.
-                    break
-                if status != "ok":
-                    # Parse fail / should_reply false — mark drafted so we
-                    # don't burn LLM calls retrying the same email forever.
-                    self._mark_drafted(full.id)
-                    continue
-                tag = self._post_draft(full, draft)
-                if tag == "ok":
-                    self._mark_drafted(full.id)
-                    posted += 1
-                else:
-                    # Not marked drafted — transient post failures retry next run.
-                    logger.warning(
-                        "Smart reply inbox post failed",
-                        reason=tag,
-                        message_id=full.id,
+                    break  # the per-run draft cap is global across users
+                # Set the SDK user ContextVar so create_email_service() (and
+                # every other user-scope secret read) resolves this user's
+                # mailbox credentials.
+                set_current_user_id(uid)
+                try:
+                    posted += self._run_for_user(
+                        uid, filter_text, MAX_DRAFTS_PER_RUN - posted
                     )
+                finally:
+                    set_current_user_id(None)
 
             if posted:
                 logger.info("Smart reply agent posted drafts", count=posted)
 
         except Exception as e:
             logger.error("Smart reply agent run failed", error=str(e))
+
+    def _run_for_user(self, uid: int, filter_text: str, budget: int) -> int:
+        """Run the draft flow for one user's mailbox. Returns drafts posted.
+
+        Caller has already set the SDK user ContextVar to ``uid``.
+        """
+        try:
+            service = create_email_service()
+        except ValueError:
+            return 0
+
+        emails = service.search(SEARCH_QUERY, max_results=SEARCH_MAX_RESULTS)
+        candidates = [e for e in emails if not self._already_drafted(uid, e.id)]
+        if not candidates:
+            return 0
+
+        matched = self._filter_emails(filter_text, candidates)[:budget]
+
+        posted = 0
+        for email in matched:
+            if posted >= budget:
+                break
+            full = service.fetch_message(email.id, max_body_chars=DRAFT_BODY_CHARS)
+            if not full:
+                continue  # transient fetch failure — retry next run
+            status, draft = self._generate_draft(full)
+            if status == "no_llm":
+                # LLM unreachable — fail closed for the rest of this run,
+                # retry on the next one.
+                break
+            if status != "ok":
+                # Parse fail / should_reply false — mark drafted so we
+                # don't burn LLM calls retrying the same email forever.
+                self._mark_drafted(uid, full.id)
+                continue
+            tag = self._post_draft(full, draft, uid)
+            if tag == "ok":
+                self._mark_drafted(uid, full.id)
+                posted += 1
+            else:
+                # Not marked drafted — transient post failures retry next run.
+                logger.warning(
+                    "Smart reply inbox post failed",
+                    reason=tag,
+                    message_id=full.id,
+                )
+        return posted
 
     # ── Filter (LLM call 1) ────────────────────────────────────────────────
 
@@ -348,8 +387,8 @@ class SmartReplyAgent(IJarvisAgent):
 
     # ── Inbox post ─────────────────────────────────────────────────────────
 
-    def _post_draft(self, email: Any, draft: str) -> str:
-        """Post one draft to the inbox with Send/Ignore buttons. Returns the post tag."""
+    def _post_draft(self, email: Any, draft: str, uid: int) -> str:
+        """Post one draft to the user's inbox with Send/Ignore buttons. Returns the post tag."""
         body = (
             f"From: {email.sender}\n"
             f"Subject: {email.subject}\n\n"
@@ -387,20 +426,20 @@ class SmartReplyAgent(IJarvisAgent):
             body=body,
             category=CATEGORY,
             interactive_elements=elements,
-            user_id=None,
+            user_id=uid,
             create_push_notification=True,
-            target_type="household",
+            target_type="user",
         )
 
-    # ── Persistent dedup ───────────────────────────────────────────────────
+    # ── Persistent dedup (keys are per-user: "{uid}:{message_id}") ─────────
 
-    def _already_drafted(self, message_id: str) -> bool:
-        return _storage.get(message_id) is not None
+    def _already_drafted(self, uid: int, message_id: str) -> bool:
+        return _storage.get(f"{uid}:{message_id}") is not None
 
-    def _mark_drafted(self, message_id: str) -> None:
+    def _mark_drafted(self, uid: int, message_id: str) -> None:
         now = datetime.now(timezone.utc)
         _storage.save(
-            message_id,
+            f"{uid}:{message_id}",
             {"drafted_at": now.isoformat()},
             expires_at=now + timedelta(days=DEDUP_TTL_DAYS),
         )
