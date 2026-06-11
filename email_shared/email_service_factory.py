@@ -46,6 +46,7 @@ def create_email_service() -> GoogleGmailService | ImapEmailService:
             use_ssl=(_storage.get_secret("IMAP_USE_SSL", scope="user") or "false").lower() == "true",
             archive_folder=_storage.get_secret("IMAP_ARCHIVE_FOLDER", scope="user") or "Archive",
             trash_folder=_storage.get_secret("IMAP_TRASH_FOLDER", scope="user") or "Trash",
+            provider=provider,  # names the server in connection errors ("Proton Mail Bridge")
         )
 
     # Default: Gmail (tokens are per-user, client_id is shared)

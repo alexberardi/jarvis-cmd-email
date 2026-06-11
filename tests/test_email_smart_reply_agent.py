@@ -49,18 +49,27 @@ def _install_email_shared() -> None:
     if "email_shared" not in sys.modules:
         sys.modules["email_shared"] = types.ModuleType("email_shared")
     _load_real("email_shared.email_message", "email_shared", "email_message.py")
+    _load_real("email_shared.senders", "email_shared", "senders.py")
     _load_real("email_shared.user_resolution", "email_shared", "user_resolution.py")
     if "email_shared.email_service_factory" not in sys.modules:
         esf = types.ModuleType("email_shared.email_service_factory")
         esf.create_email_service = lambda: None
         esf.get_email_provider = lambda: "gmail"
         sys.modules["email_shared.email_service_factory"] = esf
+    _load_real("email_shared.connection_health", "email_shared", "connection_health.py")
+    _load_real("email_shared.reply_rubric", "email_shared", "reply_rubric.py")
+    _load_real("email_shared.reply_drafts", "email_shared", "reply_drafts.py")
 
 
 _install_email_shared()
 _agent_mod = _load_real(
     "smart_reply_agent_under_test", "agents", "smart_reply", "agent.py"
 )
+
+# The exact class the agent module bound at load time — other test files
+# reload email_shared.email_message, so raise THIS one or the agent's
+# except clause won't match.
+EmailConnectionError = sys.modules["email_shared.email_message"].EmailConnectionError
 
 
 def _make_email(idx: int) -> SimpleNamespace:
@@ -226,78 +235,117 @@ class TestDeclaration:
         assert agent.get_alerts() == []
 
 
-# ── Filter (LLM call 1): fail-closed matrix ──────────────────────────────────
+# ── Stage 1 (LLM call 1): rubric judge wiring + deterministic CC screen ──────
+# The fail-closed matrix for select_reply_worthy itself lives in
+# tests/test_email_reply_rubric.py — these tests cover the agent pipeline.
 
 
-class TestFilterEmails:
-    def test_no_emails_returns_empty(self, agent):
-        assert agent._filter_emails("clients", []) == []
-
-    def test_llm_unavailable_fails_closed(self, agent, monkeypatch):
-        monkeypatch.setitem(sys.modules, "services.node_llm_client", None)
-        result = agent._filter_emails("clients", [_make_email(1)])
-        assert result == []
-
-    def test_llm_returns_matching_indices(self, agent, monkeypatch):
-        emails = [_make_email(1), _make_email(2), _make_email(3)]
-        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: "[1, 3]")
-        matched = agent._filter_emails("clients", emails)
-        assert matched == [emails[0], emails[2]]
-
-    def test_llm_returns_empty_array(self, agent, monkeypatch):
-        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: "[]")
-        assert agent._filter_emails("clients", [_make_email(1)]) == []
-
-    def test_llm_returns_none_fails_closed(self, agent, monkeypatch):
-        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: None)
-        assert agent._filter_emails("clients", [_make_email(1)]) == []
-
-    def test_llm_returns_garbage_fails_closed(self, agent, monkeypatch):
-        _install_fake_node_llm_client(
-            monkeypatch, lambda *a, **kw: "Emails 1 and 2 look important."
-        )
-        assert agent._filter_emails("clients", [_make_email(1), _make_email(2)]) == []
-
-    def test_llm_strips_think_block_and_code_fence(self, agent, monkeypatch):
-        emails = [_make_email(1), _make_email(2), _make_email(3)]
-        raw = "<think>let me reason</think>\n```json\n[2]\n```"
-        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: raw)
-        matched = agent._filter_emails("rule", emails)
-        assert matched == [emails[1]]
-
-    def test_llm_out_of_range_indices_dropped(self, agent, monkeypatch):
-        emails = [_make_email(1), _make_email(2)]
-        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: "[1, 5, 99, 0, -1]")
-        matched = agent._filter_emails("rule", emails)
-        assert matched == [emails[0]]
-
-    def test_llm_non_numeric_indices_dropped(self, agent, monkeypatch):
-        emails = [_make_email(1), _make_email(2)]
-        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: '["foo", 2]')
-        matched = agent._filter_emails("rule", emails)
-        assert matched == [emails[1]]
-
-    def test_prompt_contains_strict_guidance_and_email_lines(self, agent, monkeypatch):
+class TestStage1RubricJudge:
+    def test_system_prompt_carries_rubric_and_user_instructions(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        _wire_service(monkeypatch, [_make_email(1)])
         captured: dict[str, Any] = {}
 
         def fake_ask(prompt: str, *, system=None, **kw):
-            captured["prompt"] = prompt
-            captured["system"] = system
-            return "[]"
+            if system and "strict email filter" in system:
+                captured["system"] = system
+                captured["prompt"] = prompt
+                return "[]"
+            return _OK_DRAFT
 
         _install_fake_node_llm_client(monkeypatch, fake_ask)
-        agent._filter_emails("only client mail", [_make_email(1)])
 
-        assert "HARD" in captured["system"]
-        assert "skip" in captured["system"].lower()
-        assert "false positive" in captured["system"].lower()
-        assert "only client mail" in captured["prompt"]
-        # Contract format: "{i}. From: {sender}\n   Subject: {subject}\n   {snippet}"
-        assert (
-            "1. From: Sender 1 <sender1@example.com>\n"
-            "   Subject: Subject 1\n"
-            "   Snippet 1"
-        ) in captured["prompt"]
+        _run(agent)
+
+        # Built-in rubric + the user's instructions applied ON TOP of it.
+        assert "reply-worthy ONLY if ALL" in captured["system"]
+        assert "apply ON TOP" in captured["system"]
+        assert "clients and invoices" in captured["system"]
+        # Candidate lines carry To/Cc so the judge can verify directness.
+        assert "To:" in captured["prompt"]
+        assert "Cc:" in captured["prompt"]
+        assert "1. From: Sender 1 <sender1@example.com>" in captured["prompt"]
+
+
+class TestDirectRecipientScreen:
+    """When the user's own address is known, CC-only candidates never reach the LLM."""
+
+    @staticmethod
+    def _capture_filter(monkeypatch, response: str) -> dict:
+        captured: dict[str, Any] = {}
+
+        def fake_ask(prompt: str, *, system=None, **kw):
+            if system and "strict email filter" in system:
+                captured["prompt"] = prompt
+                return response
+            return _OK_DRAFT
+
+        _install_fake_node_llm_client(monkeypatch, fake_ask)
+        return captured
+
+    def test_cc_only_candidates_dropped_pre_llm_when_address_known(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        storage_backend.secrets[("IMAP_USERNAME", "user")] = "alex@example.com"
+        cc_only = _make_email(1)
+        cc_only.to = "other@example.com"
+        cc_only.cc = "alex@example.com"
+        direct = _make_email(2)
+        direct.to = "Alex Berardi <ALEX@example.com>"  # case-insensitive match
+        _wire_service(monkeypatch, [cc_only, direct])
+        captured = self._capture_filter(monkeypatch, "[1]")  # index 1 is now id-2
+
+        _run(agent)
+
+        assert "Subject 1" not in captured["prompt"]
+        assert "Subject 2" in captured["prompt"]
+        assert len(inbox_backend.calls) == 1
+        assert inbox_backend.calls[0]["title"] == "Reply ready — Sender 2"
+
+    def test_drop_skipped_when_address_unknown(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        # No IMAP_USERNAME secret (gmail account) — the CC-only candidate
+        # still reaches the LLM; directness is judged from the To/Cc lines.
+        cc_only = _make_email(1)
+        cc_only.to = "other@example.com"
+        cc_only.cc = "alex@example.com"
+        _wire_service(monkeypatch, [cc_only])
+        captured = self._capture_filter(monkeypatch, "[]")
+
+        _run(agent)
+
+        assert "Subject 1" in captured["prompt"]
+
+    def test_empty_to_header_never_false_drops(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        # Some providers omit To on fetch — an empty header must not drop.
+        storage_backend.secrets[("IMAP_USERNAME", "user")] = "alex@example.com"
+        no_to = _make_email(1)  # SimpleNamespace without to/cc attributes
+        _wire_service(monkeypatch, [no_to])
+        captured = self._capture_filter(monkeypatch, "[]")
+
+        _run(agent)
+
+        assert "Subject 1" in captured["prompt"]
+
+    def test_all_cc_only_skips_llm_entirely(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        storage_backend.secrets[("IMAP_USERNAME", "user")] = "alex@example.com"
+        cc_only = _make_email(1)
+        cc_only.to = "other@example.com"
+        cc_only.cc = "alex@example.com"
+        _wire_service(monkeypatch, [cc_only])
+        ask = MagicMock()
+        _install_fake_node_llm_client(monkeypatch, ask)
+
+        _run(agent)
+
+        ask.assert_not_called()
+        assert inbox_backend.calls == []
 
 
 # ── Draft generation (LLM call 2): JSON parsing ──────────────────────────────
@@ -361,6 +409,22 @@ class TestGenerateDraft:
         assert "should_reply" in captured["system"]
         assert "150 words" in captured["system"]
 
+    def test_draft_system_prompt_declines_automated_mail(self, agent, monkeypatch):
+        # Belt-and-braces alongside the deterministic screen: the stage-2
+        # prompt itself tells the model automated/marketing mail gets
+        # should_reply=false.
+        captured: dict[str, Any] = {}
+
+        def fake_ask(prompt: str, *, system=None, **kw):
+            captured["system"] = system
+            return _OK_DRAFT
+
+        _install_fake_node_llm_client(monkeypatch, fake_ask)
+        agent._generate_draft(_make_email(1))
+
+        assert "no-reply" in captured["system"]
+        assert "marketing" in captured["system"]
+
 
 # ── run(): gates, cap, post shape, dedup interplay ───────────────────────────
 
@@ -419,18 +483,24 @@ class TestRunFlow:
         assert call["command_name"] == "email"
         assert call["title"] == "Reply ready — Sender 1"
         assert call["summary"] == "Subject 1"
+        # The draft lives ONLY in metadata.editable_text now — the body stays
+        # From/Subject/snippet so the item is informative without the editor.
         assert call["body"] == (
             "From: Sender 1 <sender1@example.com>\n"
             "Subject: Subject 1\n\n"
-            "Snippet 1\n\n"
-            "— Draft reply —\n\n"
-            "Sounds good — see you then."
+            "Snippet 1"
         )
+        assert "— Draft reply —" not in call["body"]
         assert call["category"] == "smart_reply"
         assert call["user_id"] == 1
         assert call["target_type"] == "user"
         assert call["create_push_notification"] is True
 
+        assert call["metadata"]["editable_text"] == {
+            "label": "Draft reply",
+            "initial": "Sounds good — see you then.",
+            "data_key": "body",
+        }
         elements = call["metadata"]["interactive_elements"]
         assert elements == [
             {
@@ -507,7 +577,7 @@ class TestRunFlow:
         ask.assert_not_called()
         assert inbox_backend.calls == []
 
-    def test_draft_parse_fail_marks_drafted_no_post(
+    def test_draft_parse_fail_marks_declined_no_post(
         self, agent, storage_backend, inbox_backend, monkeypatch
     ):
         _wire_service(monkeypatch, [_make_email(1)])
@@ -516,9 +586,12 @@ class TestRunFlow:
         _run(agent)
 
         assert inbox_backend.calls == []
-        assert storage_backend.get("email_smart_reply", "1:id-1") is not None
+        # Declined, not posted — suppresses re-judging but never delivery.
+        record = storage_backend.get("email_smart_reply", "1:id-1")
+        assert record is not None
+        assert record["posted"] is False
 
-    def test_should_reply_false_marks_drafted_no_post(
+    def test_should_reply_false_marks_declined_no_post(
         self, agent, storage_backend, inbox_backend, monkeypatch
     ):
         _wire_service(monkeypatch, [_make_email(1)])
@@ -530,7 +603,28 @@ class TestRunFlow:
         _run(agent)
 
         assert inbox_backend.calls == []
-        assert storage_backend.get("email_smart_reply", "1:id-1") is not None
+        record = storage_backend.get("email_smart_reply", "1:id-1")
+        assert record is not None
+        assert record["posted"] is False
+
+    def test_declined_email_not_rejudged_next_run(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        _wire_service(monkeypatch, [_make_email(1)])
+        _install_fake_node_llm_client(
+            monkeypatch,
+            _staged_ask_llm("[1]", ['{"should_reply": false, "draft": ""}']),
+        )
+        _run(agent)
+        assert storage_backend.get("email_smart_reply", "1:id-1")["posted"] is False
+
+        # Next tick: the declined id never reaches the LLM again.
+        ask = MagicMock()
+        _install_fake_node_llm_client(monkeypatch, ask)
+        _run(agent)
+
+        ask.assert_not_called()
+        assert inbox_backend.calls == []
 
     def test_llm_unreachable_at_draft_stage_does_not_mark(
         self, agent, storage_backend, inbox_backend, monkeypatch
@@ -574,6 +668,161 @@ class TestRunFlow:
         assert inbox_backend.calls == []
 
 
+# ── Per-match fetch failures: guarded, fed to health, user-scoped ────────────
+
+
+class TestFetchConnectionFailure:
+    """fetch_message sits after a successful search — its EmailConnectionError
+    must be swallowed (scheduler keeps probing), feed the per-tick health
+    aggregation (fetch-only outages accumulate to the notice threshold), stop
+    only THIS user, and leave the email unmarked so it retries next tick."""
+
+    def test_fetch_failure_reported_once_and_remaining_users_still_run(
+        self, agent, storage_backend, inbox_backend, context_calls, monkeypatch
+    ):
+        monkeypatch.setattr(_agent_mod, "find_configured_user_ids", lambda: [1, 2])
+        service = MagicMock()
+        service.search.return_value = [_make_email(1)]
+        service.fetch_message.side_effect = EmailConnectionError(
+            "Couldn't connect to the email server at localhost:1143"
+        )
+        monkeypatch.setattr(_agent_mod, "create_email_service", lambda: service)
+        _install_fake_node_llm_client(
+            monkeypatch, _staged_ask_llm("[1]", [_OK_DRAFT] * 2)
+        )
+
+        _run(agent)  # must not raise (asyncio.run re-raises any escape)
+
+        # Both users were processed — a fetch failure stops only ITS user.
+        assert context_calls == [1, None, 2, None]
+        assert service.search.call_count == 2
+        # The tick recorded exactly ONE failure (per-tick aggregation), even
+        # though both users' fetches died.
+        record = storage_backend.get("email_health", "consecutive_failures")
+        assert record["count"] == 1
+        # Nothing posted, and the email is NOT marked drafted/declined — it
+        # retries next tick.
+        assert inbox_backend.calls == []
+        assert storage_backend.get("email_smart_reply", "1:id-1") is None
+        assert storage_backend.get("email_smart_reply", "2:id-1") is None
+
+    def test_persistent_fetch_outage_accumulates_to_notice(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        # Search keeps working but fetch is down — three such ticks must
+        # surface the outage notice exactly like a search outage.
+        service = MagicMock()
+        service.search.return_value = [_make_email(1)]
+        service.fetch_message.side_effect = EmailConnectionError(
+            "Couldn't connect to the email server at localhost:1143"
+        )
+        monkeypatch.setattr(_agent_mod, "create_email_service", lambda: service)
+        _install_fake_node_llm_client(
+            monkeypatch, _staged_ask_llm("[1]", [_OK_DRAFT] * 3)
+        )
+
+        _run(agent)
+        _run(agent)
+        assert inbox_backend.calls == []
+
+        _run(agent)
+        assert len(inbox_backend.calls) == 1
+        assert inbox_backend.calls[0]["title"] == "Email connection problem"
+
+
+# ── Deterministic bulk-sender screen (pre-LLM) ───────────────────────────────
+
+
+def _bulk_email(idx: int) -> SimpleNamespace:
+    e = _make_email(idx)
+    e.sender = f"Shop {idx} <noreply@shop{idx}.example.com>"
+    return e
+
+
+class TestBulkSenderScreen:
+    def test_all_bulk_candidates_never_reach_llm(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        # Every candidate is a bulk sender — the LLM is never consulted and
+        # nothing is posted (the field-incident regression guard).
+        _wire_service(monkeypatch, [_bulk_email(1), _bulk_email(2)])
+        ask = MagicMock()
+        _install_fake_node_llm_client(monkeypatch, ask)
+
+        _run(agent)
+
+        ask.assert_not_called()
+        assert inbox_backend.calls == []
+
+    def test_unsubscribe_signal_screens_human_looking_sender(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        # marketplace-messages@amazon.com style: human-ish local part, but the
+        # List-Unsubscribe header marks it bulk.
+        e = _make_email(1)
+        e.sender = "Amazon <marketplace-messages@amazon.com>"
+        e.unsubscribe_url = "https://amazon.com/unsub"
+        _wire_service(monkeypatch, [e])
+        ask = MagicMock()
+        _install_fake_node_llm_client(monkeypatch, ask)
+
+        _run(agent)
+
+        ask.assert_not_called()
+        assert inbox_backend.calls == []
+
+    def test_mixed_candidates_only_human_reaches_filter(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        emails = [_bulk_email(1), _make_email(2)]
+        _wire_service(monkeypatch, emails)
+
+        captured: dict[str, Any] = {}
+
+        def fake_ask(prompt: str, *, system=None, **kw):
+            if system and "strict email filter" in system:
+                captured["prompt"] = prompt
+                return "[1]"  # index 1 is now the human email (id-2)
+            return _OK_DRAFT
+
+        _install_fake_node_llm_client(monkeypatch, fake_ask)
+
+        _run(agent)
+
+        assert "Subject 1" not in captured["prompt"]
+        assert "Subject 2" in captured["prompt"]
+        assert len(inbox_backend.calls) == 1
+        assert inbox_backend.calls[0]["title"] == "Reply ready — Sender 2"
+
+    def test_screened_bulk_not_marked_drafted(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        # Screening is deterministic and free — no need to burn a dedup
+        # record; the screen drops them again next run.
+        _wire_service(monkeypatch, [_bulk_email(1)])
+        ask = MagicMock()
+        _install_fake_node_llm_client(monkeypatch, ask)
+
+        _run(agent)
+
+        assert storage_backend.get("email_smart_reply", "1:id-1") is None
+
+    def test_filter_system_prompt_excludes_automated_senders(
+        self, agent, monkeypatch
+    ):
+        captured: dict[str, Any] = {}
+
+        def fake_ask(prompt: str, *, system=None, **kw):
+            captured["system"] = system
+            return "[]"
+
+        _install_fake_node_llm_client(monkeypatch, fake_ask)
+        _agent_mod.select_reply_worthy([_make_email(1)], "clients", None)
+
+        assert "NEVER reply-worthy" in captured["system"]
+        assert "no-reply" in captured["system"]
+
+
 # ── Persistent dedup ─────────────────────────────────────────────────────────
 
 
@@ -597,6 +846,7 @@ class TestPersistentDedup:
         record = storage_backend.records[("email_smart_reply", "1:id-1")]
         drafted_at = datetime.fromisoformat(record["drafted_at"])
         assert before <= drafted_at <= after
+        assert record["posted"] is True  # a real post, not a decline
 
         expires_at = storage_backend.expires[("email_smart_reply", "1:id-1")]
         assert before + timedelta(days=7) <= expires_at <= after + timedelta(days=7)

@@ -3,12 +3,20 @@
 Runs every 5 minutes. The whole feature is OFF until the user sets the
 EMAIL_NOTIFICATION_FILTER secret (their free-text importance rule). Each run
 iterates the mailbox-configured users (mailbox secrets are user-scoped, and
-agents have no ambient user — see email_shared.user_resolution) and, with the
-SDK user ContextVar set to each user in turn:
+agents have no ambient user — see email_shared.user_resolution; the optional
+EMAIL_AGENT_USER identity pins the agent to ONE household member instead, and
+targets the outage notice at them) and, with the SDK user ContextVar set to
+each user in turn:
 
-1. Search unread inbox mail from the last day, drop already-drafted ids.
-2. LLM call 1 — strict indices filter (fail-closed, same discipline as the
-   news alerts agent): which emails match the user's rule.
+1. Search unread inbox mail from the last day, drop already-drafted ids and
+   bulk/automated senders (deterministic screen — see email_shared.senders;
+   they never reach the LLM and never get drafts). When the user's own
+   address is known, candidates where the user is only CC'd are also dropped
+   deterministically (email_shared.reply_rubric.is_direct_recipient).
+2. LLM call 1 — email_shared.reply_rubric.select_reply_worthy: the built-in
+   BASELINE_RULES rubric + the user's instructions applied ON TOP, judged in
+   one fail-closed strict-indices call (same discipline as the news alerts
+   agent).
 3. LLM call 2 per match — write a brief draft reply, or decline
    (should_reply=false) for mail that needs no response.
 4. Post the draft to the inbox (InboxDetail surface) with Send/Ignore
@@ -16,14 +24,25 @@ SDK user ContextVar set to each user in turn:
    dismiss_draft callbacks. Nothing is ever auto-sent — the tap IS the
    confirmation, with the draft on screen.
 
+Connection failures (EmailConnectionError from search OR the per-match fetch)
+are recorded in email_shared.connection_health — never read as "no
+candidates". Health is aggregated PER TICK: each user's loop pass yields a
+connection outcome, and after the loop the tracker is called at most once —
+any outage reports a failure (a healthy mailbox must not clear a broken
+mailbox's streak), otherwise any reachable mailbox records success. Three
+consecutive failure TICKS post ONE cross-agent outage notice per day; the
+exception never escapes run(), so the scheduler keeps probing every tick.
+
 Dedup is PERSISTENT: JarvisStorage records keyed by "{user_id}:{message_id}"
-with a 7-day TTL, so drafts survive restarts. (The alerts agent's in-memory
-dedup re-alerts after a restart; a duplicate draft push would be far worse.)
+with a 7-day TTL, so drafts survive restarts. The dedup, the draft LLM call,
+and the inbox post builder live in email_shared.reply_drafts — SHARED with the
+email_alerts agent's VIP/urgent path so the two can never double-post the same
+message. Posts are marked via mark_posted; stage-2 declines (should_reply
+false / parse_fail) via mark_declined — this agent skips anything already
+HANDLED (posted or declined), while the email_alerts gate only honors real
+posts, so a decline here can never suppress a VIP/urgent notification.
 """
 
-import json
-import re
-from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 try:
@@ -37,17 +56,36 @@ from jarvis_command_sdk import (
     AgentSchedule,
     IJarvisAgent,
     IJarvisSecret,
-    JarvisInbox,
     JarvisSecret,
     JarvisStorage,
     set_current_user_id,
 )
 
+from email_shared.connection_health import record_success, report_connection_failure
+from email_shared.email_message import EmailConnectionError
 from email_shared.email_service_factory import create_email_service, get_email_provider
-from email_shared.user_resolution import find_configured_user_ids
+from email_shared.senders import is_bulk_sender
+from email_shared.reply_drafts import (
+    DRAFT_BODY_CHARS,
+    already_handled,
+    generate_draft_status,
+    mark_declined,
+    mark_posted,
+    post_reply_item,
+)
+from email_shared.reply_rubric import (
+    is_direct_recipient,
+    resolve_user_address,
+    select_reply_worthy,
+)
+from email_shared.user_resolution import (
+    configured_agent_user_id,
+    find_configured_user_ids,
+    resolve_agent_user_ids,
+)
 
-# Records (drafted-id dedup) live under this namespace; secret reads are
-# global by (key, scope) so the same facade serves both.
+# Secret reads are global by (key, scope); dedup records share the same
+# namespace via email_shared.reply_drafts.
 _storage = JarvisStorage("email_smart_reply")
 
 REFRESH_INTERVAL_SECONDS = 300  # 5 minutes
@@ -55,32 +93,6 @@ SEARCH_QUERY = "is:unread in:inbox newer_than:1d"
 SEARCH_MAX_RESULTS = 20
 MAX_DRAFTS_PER_RUN = 2  # global cap across all users per run
 MAX_USERS_PER_RUN = 5
-DRAFT_BODY_CHARS = 3000
-DEDUP_TTL_DAYS = 7
-CATEGORY = "smart_reply"  # unknown to mobile → InboxDetail fallback (body + elements)
-
-_DRAFT_SYSTEM = (
-    "You write brief reply drafts on behalf of the user. Read the email and "
-    "draft a short reply the user could send as-is:\n"
-    "- Plain text only. At most 150 words. No signature, no subject line, "
-    "no markdown.\n"
-    "- Be direct and polite; match the sender's tone.\n"
-    "- If the email needs no response (newsletters, receipts, FYI-only "
-    "mail), set should_reply to false.\n"
-    'Output ONLY JSON: {"should_reply": true|false, "draft": "..."} — '
-    "no prose, no code fences, no explanation."
-)
-
-
-def _strip_llm_noise(raw: str) -> str:
-    """Strip <think> blocks and markdown code fences from an LLM response."""
-    cleaned = re.sub(
-        r"<think>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE
-    ).strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-    return cleaned
 
 
 class SmartReplyAgent(IJarvisAgent):
@@ -106,14 +118,26 @@ class SmartReplyAgent(IJarvisAgent):
         return [
             JarvisSecret(
                 "EMAIL_NOTIFICATION_FILTER",
-                "Free-text rule for which emails deserve a drafted reply "
-                "(e.g. 'clients, invoices, anything from my kid's school'). "
-                "Leave blank to disable smart replies.",
+                "Free-text instructions for which emails deserve a drafted "
+                "reply (e.g. 'clients, invoices, anything from my kid's "
+                "school'). Applied ON TOP of the built-in rules: real humans "
+                "only, addressed to you directly, and the email actually "
+                "warrants a response. Leave blank to disable smart replies.",
                 "integration",
                 "string",
                 required=False,
                 is_sensitive=False,
                 friendly_name="Smart Reply Filter",
+            ),
+            JarvisSecret(
+                "EMAIL_AGENT_USER",
+                "The household member this agent runs as and notifies. "
+                "Leave unset to run for every member with a configured mailbox.",
+                "integration",
+                "user",
+                required=False,
+                is_sensitive=False,
+                friendly_name="Notify user",
             ),
         ]
 
@@ -150,7 +174,10 @@ class SmartReplyAgent(IJarvisAgent):
     async def run(self) -> None:
         """Filter unread email and post draft replies, per configured user."""
         try:
-            user_ids = find_configured_user_ids()
+            # The module-level find_configured_user_ids is passed explicitly
+            # so the EMAIL_AGENT_USER identity check sees the same lookup
+            # tests patch on this module.
+            user_ids = resolve_agent_user_ids(find_configured_user_ids)
             if not user_ids:
                 logger.debug("Smart reply agent: no users with a configured mailbox")
                 return
@@ -160,6 +187,8 @@ class SmartReplyAgent(IJarvisAgent):
                 return  # feature is OFF until the user writes a rule
 
             posted = 0
+            outage: str | None = None
+            reachable = False
             for uid in user_ids[:MAX_USERS_PER_RUN]:
                 if posted >= MAX_DRAFTS_PER_RUN:
                     break  # the per-run draft cap is global across users
@@ -168,11 +197,27 @@ class SmartReplyAgent(IJarvisAgent):
                 # mailbox credentials.
                 set_current_user_id(uid)
                 try:
-                    posted += self._run_for_user(
+                    user_posted, failure, ok = self._run_for_user(
                         uid, filter_text, MAX_DRAFTS_PER_RUN - posted
                     )
+                    posted += user_posted
+                    if failure is not None:
+                        outage = failure
+                    elif ok:
+                        reachable = True
                 finally:
                     set_current_user_id(None)
+
+            # Per-TICK health aggregation — the tracker is called AT MOST
+            # once per tick so N broken mailboxes are one failure (the
+            # debounce threshold means ticks, not users) and a healthy
+            # mailbox can never clear a broken mailbox's failure streak.
+            # With an explicit EMAIL_AGENT_USER identity the outage notice
+            # targets that user; otherwise it stays household-wide.
+            if outage is not None:
+                report_connection_failure(outage, user_id=configured_agent_user_id())
+            elif reachable:
+                record_success()
 
             if posted:
                 logger.info("Smart reply agent posted drafts", count=posted)
@@ -180,28 +225,83 @@ class SmartReplyAgent(IJarvisAgent):
         except Exception as e:
             logger.error("Smart reply agent run failed", error=str(e))
 
-    def _run_for_user(self, uid: int, filter_text: str, budget: int) -> int:
-        """Run the draft flow for one user's mailbox. Returns drafts posted.
+    def _run_for_user(
+        self, uid: int, filter_text: str, budget: int
+    ) -> tuple[int, str | None, bool]:
+        """Run the draft flow for one user's mailbox.
 
-        Caller has already set the SDK user ContextVar to ``uid``.
+        Caller has already set the SDK user ContextVar to ``uid``. Returns
+        ``(drafts_posted, connection_failure, reachable)`` — the connection
+        outcome feeds run()'s per-tick health aggregation instead of hitting
+        the tracker directly (one broken mailbox among N must not be masked
+        or multiply-counted). ``connection_failure`` is the failure
+        description (search OR per-match fetch), ``reachable`` is True only
+        when the mailbox was actually probed successfully; both are falsy
+        when no service could be constructed (neutral — nothing was probed).
         """
         try:
             service = create_email_service()
         except ValueError:
-            return 0
+            return 0, None, False
 
-        emails = service.search(SEARCH_QUERY, max_results=SEARCH_MAX_RESULTS)
+        try:
+            emails = service.search(SEARCH_QUERY, max_results=SEARCH_MAX_RESULTS)
+        except EmailConnectionError as e:
+            # Mailbox unreachable — must never read as "no candidates".
+            # Swallowing here keeps the scheduler's 3-strike auto-disable
+            # from tripping so we keep probing every tick.
+            return 0, e.description, False
+
         candidates = [e for e in emails if not self._already_drafted(uid, e.id)]
-        if not candidates:
-            return 0
 
-        matched = self._filter_emails(filter_text, candidates)[:budget]
+        # Deterministic bulk-sender screen BEFORE the stage-1 LLM filter. A
+        # field incident saw a marketing email get a drafted reply — the LLM
+        # filter alone is insufficient. Bulk senders never reach the LLM and
+        # never get drafts.
+        non_bulk = [e for e in candidates if not is_bulk_sender(e)]
+        if len(non_bulk) < len(candidates):
+            logger.info(
+                "Smart reply: screened bulk senders before LLM filter",
+                screened=len(candidates) - len(non_bulk),
+                remaining=len(non_bulk),
+            )
+        candidates = non_bulk
+
+        # Deterministic directness screen: when the user's own address is
+        # known, mail where they're only CC'd (or part of a list blast) never
+        # reaches the LLM. Unknown address defers entirely to the LLM judge.
+        user_address = resolve_user_address()
+        if user_address:
+            direct = [e for e in candidates if is_direct_recipient(e, user_address)]
+            if len(direct) < len(candidates):
+                logger.info(
+                    "Smart reply: dropped CC-only candidates before LLM judge",
+                    dropped=len(candidates) - len(direct),
+                    remaining=len(direct),
+                )
+            candidates = direct
+        if not candidates:
+            return 0, None, True
+
+        # Stage 1 — single fail-closed LLM call judging the built-in rubric
+        # plus the user's instructions (email_shared.reply_rubric).
+        matched = select_reply_worthy(candidates, filter_text, user_address)[:budget]
 
         posted = 0
         for email in matched:
             if posted >= budget:
                 break
-            full = service.fetch_message(email.id, max_body_chars=DRAFT_BODY_CHARS)
+            try:
+                full = service.fetch_message(
+                    email.id, max_body_chars=DRAFT_BODY_CHARS
+                )
+            except EmailConnectionError as e:
+                # Connection died mid-run (or a fetch-only outage: search
+                # cached/cheap but fetch unreachable). Stop THIS user, leave
+                # the email unmarked so it retries next tick, and surface
+                # the failure as this user's outcome — persistent fetch-only
+                # outages must accumulate to the notice threshold too.
+                return posted, e.description, False
             if not full:
                 continue  # transient fetch failure — retry next run
             status, draft = self._generate_draft(full)
@@ -210,9 +310,11 @@ class SmartReplyAgent(IJarvisAgent):
                 # retry on the next one.
                 break
             if status != "ok":
-                # Parse fail / should_reply false — mark drafted so we
-                # don't burn LLM calls retrying the same email forever.
-                self._mark_drafted(uid, full.id)
+                # Parse fail / should_reply false — mark DECLINED so we don't
+                # burn LLM calls re-judging the same email forever, without
+                # blocking the email_alerts VIP/urgent gate (already_posted
+                # ignores declines — a decline must never suppress delivery).
+                mark_declined(uid, full.id)
                 continue
             tag = self._post_draft(full, draft, uid)
             if tag == "ok":
@@ -225,224 +327,48 @@ class SmartReplyAgent(IJarvisAgent):
                     reason=tag,
                     message_id=full.id,
                 )
-        return posted
+        return posted, None, True
 
-    # ── Filter (LLM call 1) ────────────────────────────────────────────────
+    # ── Filter (LLM call 1) — email_shared.reply_rubric.select_reply_worthy ─
 
     def _read_filter(self) -> str:
         """Return the user's EMAIL_NOTIFICATION_FILTER value (empty string if unset)."""
         return (_storage.get_secret("EMAIL_NOTIFICATION_FILTER") or "").strip()
 
-    def _filter_emails(self, filter_text: str, emails: List[Any]) -> List[Any]:
-        """Ask the LLM which emails match the user's rule. Returns subset.
-
-        Single LLM call returning only matching email numbers — keeps the
-        decision deterministic to verify and prevents the model from
-        smuggling in non-matching emails through composition.
-
-        Fail-CLOSED contract: when a filter is set and we can't reliably
-        determine matches (LLM unreachable, malformed output, no parseable
-        indices), we return [] rather than drafting replies to mail the user
-        didn't ask about. The next run will retry.
-        """
-        try:
-            from services.node_llm_client import ask_llm
-        except ImportError:
-            logger.warning("Smart reply filter: ask_llm unavailable; skipping run (fail-closed)")
-            return []
-
-        if not emails:
-            return []
-
-        email_lines = []
-        for i, e in enumerate(emails, start=1):
-            email_lines.append(
-                f"{i}. From: {e.sender}\n"
-                f"   Subject: {e.subject}\n"
-                f"   {(e.snippet or '').strip()[:300]}"
-            )
-
-        system = (
-            "You are a strict email filter. Your only job is to identify "
-            "which emails match the user's rule. Treat the rule as a HARD "
-            "constraint:\n"
-            "- Match only emails that CLEARLY and DIRECTLY satisfy the rule.\n"
-            "- Tangential, adjacent, or 'kind of related' emails do NOT match.\n"
-            "- When in doubt, SKIP the email. The cost of a false negative "
-            "(missing one match) is much lower than a false positive "
-            "(drafting a reply to an email the user explicitly asked not to "
-            "be bothered about).\n"
-            "- Do NOT rewrite, summarize, or compose anything. Output ONLY a "
-            "JSON array of the matching email numbers."
-        )
-
-        prompt = (
-            f'The user\'s rule:\n"""\n{filter_text}\n"""\n\n'
-            f"Emails ({len(emails)} total):\n\n"
-            + "\n\n".join(email_lines) +
-            "\n\nReturn the numbers of emails that match the rule, as a JSON "
-            'array. Example: [1, 4, 7]. If nothing matches, return: []. '
-            "Output ONLY the array — no prose, no code fences, no explanation."
-        )
-
-        raw = ask_llm(prompt, system=system) or ""
-        if not raw:
-            logger.warning(
-                "Smart reply filter: empty LLM response; skipping run (fail-closed)",
-                email_count=len(emails),
-            )
-            return []
-
-        cleaned = _strip_llm_noise(raw)
-        # Find the first JSON array
-        match = re.search(r"\[[^\[\]]*\]", cleaned, re.DOTALL)
-        if match:
-            cleaned = match.group(0)
-
-        try:
-            parsed = json.loads(cleaned)
-            if not isinstance(parsed, list):
-                raise ValueError("expected a JSON array of indices")
-        except Exception as e:
-            logger.warning(
-                "Smart reply filter: parse failed; skipping run (fail-closed)",
-                error=str(e),
-                raw=raw[:200],
-            )
-            return []
-
-        matched: List[Any] = []
-        for idx in parsed:
-            try:
-                i = int(idx)
-            except (TypeError, ValueError):
-                continue
-            if 1 <= i <= len(emails):
-                matched.append(emails[i - 1])
-
-        logger.info(
-            "Smart reply filter applied",
-            input_emails=len(emails),
-            matched=len(matched),
-        )
-        return matched
-
-    # ── Draft generation (LLM call 2) ──────────────────────────────────────
+    # ── Draft generation (LLM call 2) — shared with email_alerts ───────────
 
     def _generate_draft(self, email: Any) -> tuple[str, str]:
         """Draft a reply to one email. Returns ``(status, draft)``.
 
-        Statuses:
+        Statuses (from email_shared.reply_drafts.generate_draft_status):
         - ``"ok"`` — draft is usable
         - ``"no_llm"`` — LLM unreachable/empty (transient; do NOT mark drafted)
         - ``"parse_fail"`` — malformed output (mark drafted, don't retry forever)
         - ``"no_reply"`` — model says the email needs no response (mark drafted)
         """
-        try:
-            from services.node_llm_client import ask_llm
-        except ImportError:
-            logger.warning("Smart reply draft: ask_llm unavailable (fail-closed)")
-            return "no_llm", ""
+        return generate_draft_status(email)
 
-        prompt = (
-            f"From: {email.sender}\n"
-            f"Subject: {email.subject}\n\n"
-            f"{email.body or email.snippet}"
-        )
-
-        raw = ask_llm(prompt, system=_DRAFT_SYSTEM) or ""
-        if not raw:
-            logger.warning(
-                "Smart reply draft: empty LLM response (fail-closed)",
-                message_id=email.id,
-            )
-            return "no_llm", ""
-
-        cleaned = _strip_llm_noise(raw)
-        # Find the first JSON object
-        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if match:
-            cleaned = match.group(0)
-
-        try:
-            parsed = json.loads(cleaned)
-            if not isinstance(parsed, dict):
-                raise ValueError("expected a JSON object")
-        except Exception as e:
-            logger.warning(
-                "Smart reply draft: parse failed",
-                error=str(e),
-                raw=raw[:200],
-                message_id=email.id,
-            )
-            return "parse_fail", ""
-
-        if not parsed.get("should_reply"):
-            return "no_reply", ""
-
-        draft = str(parsed.get("draft") or "").strip()
-        if not draft:
-            return "parse_fail", ""
-        return "ok", draft
-
-    # ── Inbox post ─────────────────────────────────────────────────────────
+    # ── Inbox post — shared builder with email_alerts ───────────────────────
 
     def _post_draft(self, email: Any, draft: str, uid: int) -> str:
         """Post one draft to the user's inbox with Send/Ignore buttons. Returns the post tag."""
-        body = (
-            f"From: {email.sender}\n"
-            f"Subject: {email.subject}\n\n"
-            f"{email.snippet}\n\n"
-            "— Draft reply —\n\n"
-            f"{draft}"
-        )
-        elements = [
-            {
-                "id": f"send-{email.id}",
-                "label": "Send reply",
-                "kind": "send",
-                "command": "email",
-                "callback": "send_draft_reply",
-                "data": {
-                    "message_id": email.id,
-                    "thread_id": email.thread_id,
-                    "body": draft,
-                },
-                "navigation_type": "stack",
-            },
-            {
-                # No navigation_type ⇒ new_notification fire-and-forget;
-                # the chip just checks off.
-                "id": f"ignore-{email.id}",
-                "label": "Ignore",
-                "command": "email",
-                "callback": "dismiss_draft",
-                "data": {"message_id": email.id},
-            },
-        ]
-        return JarvisInbox("email").post(
+        return post_reply_item(
+            uid,
+            email,
+            draft,
             title=f"Reply ready — {email.sender_name}",
-            summary=email.subject,
-            body=body,
-            category=CATEGORY,
-            interactive_elements=elements,
-            user_id=uid,
-            create_push_notification=True,
-            target_type="user",
+            reason="filter",
         )
 
-    # ── Persistent dedup (keys are per-user: "{uid}:{message_id}") ─────────
+    # ── Persistent dedup (shared namespace with email_alerts) ───────────────
 
     def _already_drafted(self, uid: int, message_id: str) -> bool:
-        return _storage.get(f"{uid}:{message_id}") is not None
+        # Posted OR declined — declined mail isn't re-judged (no repeated
+        # LLM burn) but stays eligible for the email_alerts VIP/urgent gate.
+        return already_handled(uid, message_id)
 
     def _mark_drafted(self, uid: int, message_id: str) -> None:
-        now = datetime.now(timezone.utc)
-        _storage.save(
-            f"{uid}:{message_id}",
-            {"drafted_at": now.isoformat()},
-            expires_at=now + timedelta(days=DEDUP_TTL_DAYS),
-        )
+        mark_posted(uid, message_id)
 
     def get_context_data(self) -> Dict[str, Any]:
         return {}

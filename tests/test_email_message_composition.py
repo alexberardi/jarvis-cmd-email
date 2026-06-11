@@ -17,6 +17,7 @@ def _stub_email_shared() -> None:
 
     em = types.ModuleType("email_shared.email_message")
     em.EmailMessage = type("EmailMessage", (), {})
+    em.EmailConnectionError = type("EmailConnectionError", (Exception,), {})
     em.extract_email = lambda x: x
     sys.modules["email_shared.email_message"] = em
 

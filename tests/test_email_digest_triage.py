@@ -51,6 +51,7 @@ def _install_email_shared() -> None:
     if "email_shared" not in sys.modules:
         sys.modules["email_shared"] = types.ModuleType("email_shared")
     _load_real("email_shared.email_message", "email_shared", "email_message.py")
+    _load_real("email_shared.senders", "email_shared", "senders.py")
     _load_real("email_shared.user_resolution", "email_shared", "user_resolution.py")
     if "email_shared.email_service_factory" not in sys.modules:
         esf = types.ModuleType("email_shared.email_service_factory")
@@ -58,6 +59,9 @@ def _install_email_shared() -> None:
         esf.get_email_provider = lambda: "gmail"
         sys.modules["email_shared.email_service_factory"] = esf
     _load_real("email_shared.triage", "email_shared", "triage.py")
+    _load_real("email_shared.connection_health", "email_shared", "connection_health.py")
+    _load_real("email_shared.reply_rubric", "email_shared", "reply_rubric.py")
+    _load_real("email_shared.reply_drafts", "email_shared", "reply_drafts.py")
 
 
 _install_email_shared()
@@ -271,7 +275,7 @@ class TestPerUserRun:
     ):
         monkeypatch.setattr(_agent_mod, "find_configured_user_ids", lambda: [4])
 
-        def boom(uid):
+        def boom(uid, reply_budget):
             raise RuntimeError("mailbox exploded")
 
         monkeypatch.setattr(agent, "_run_for_user", boom)
@@ -297,21 +301,19 @@ class TestPerUserRun:
         assert visited == [1, 2, 3, 4, 5]
 
 
-class TestAlertDedupPerUser:
-    def test_vip_dedup_ids_are_uid_prefixed(self, agent):
+class TestTriggerPredicates:
+    """VIP/urgent are now bool predicates — posting (and the persistent shared
+    dedup) lives in _post_reply_items / email_shared.reply_drafts; the full
+    flow is covered in test_email_alert_reply_posts.py."""
+
+    def test_vip_match_is_boolean(self, agent):
         email = _make_email(1)
-        vip = {"sender1@example.com"}
 
-        first = agent._check_vip(email, vip, 3)
-        repeat = agent._check_vip(email, vip, 3)
-        other_user = agent._check_vip(email, vip, 4)
+        assert agent._check_vip(email, {"sender1@example.com"}) is True
+        assert agent._check_vip(email, {"other@example.com"}) is False
+        assert agent._check_vip(email, set()) is False  # no VIP list → no match
 
-        assert len(first) == 1
-        assert repeat == []  # deduped for uid 3
-        assert len(other_user) == 1  # but NOT for uid 4
-        assert agent._alerted_email_ids == {"3:id-1", "4:id-1"}
-
-    def test_urgent_dedup_ids_are_uid_prefixed(self, agent):
+    def test_urgent_match_is_boolean(self, agent):
         email = SimpleNamespace(
             id="id-9",
             sender="Boss <boss@example.com>",
@@ -319,13 +321,6 @@ class TestAlertDedupPerUser:
             subject="URGENT: deadline today",
             snippet="please respond asap",
         )
-        keywords = {"urgent"}
 
-        first = agent._check_urgent(email, keywords, 3)
-        repeat = agent._check_urgent(email, keywords, 3)
-        other_user = agent._check_urgent(email, keywords, 4)
-
-        assert len(first) == 1
-        assert repeat == []
-        assert len(other_user) == 1
-        assert agent._alerted_email_ids == {"3:id-9", "4:id-9"}
+        assert agent._check_urgent(email, {"urgent"}) is True
+        assert agent._check_urgent(email, {"invoice"}) is False

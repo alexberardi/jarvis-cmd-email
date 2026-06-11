@@ -21,13 +21,20 @@ except ImportError:
     logger = logging.getLogger("jarvis-cmd-email")
 
 from .email_message import (
+    EmailConnectionError,
     EmailMessage,
     extract_email,
     extract_name,
+    parse_bulk_headers,
     parse_unsubscribe_headers,
 )
 
 BASE_URL = "https://gmail.googleapis.com/gmail/v1"
+
+# Connection-class transport failures: can't reach Google at all (or it never
+# answered). Distinct from HTTP error statuses, which mean Gmail responded.
+_GMAIL_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)
+_GMAIL_UNREACHABLE = "Couldn't reach Gmail — the network or Google may be down"
 
 
 class GoogleGmailService:
@@ -86,12 +93,19 @@ class GoogleGmailService:
                     detail = self._fetch_message_detail(msg_ref["id"])
                     if detail:
                         emails.append(self._parse_message(detail))
+                except EmailConnectionError:
+                    raise  # transport died mid-list — surface, don't skip
                 except Exception as e:
                     logger.debug("Skipping unparseable Gmail message", error=str(e))
                     continue
 
             return emails
 
+        except _GMAIL_CONNECT_ERRORS as e:
+            logger.error("Gmail unreachable", error=str(e))
+            raise EmailConnectionError(_GMAIL_UNREACHABLE) from e
+        except EmailConnectionError:
+            raise
         except httpx.HTTPStatusError as e:
             logger.error("Gmail API error", status_code=e.response.status_code, detail=str(e))
             return []
@@ -121,6 +135,8 @@ class GoogleGmailService:
                 return None
             msg = self._parse_message(detail, max_body_chars=max_body_chars)
             return msg
+        except EmailConnectionError:
+            raise
         except Exception as e:
             logger.error("Failed to fetch message", message_id=message_id, error=str(e))
             return None
@@ -246,13 +262,22 @@ class GoogleGmailService:
     # -- Internal helpers -------------------------------------------------------
 
     def _fetch_message_detail(self, message_id: str) -> dict | None:
-        """Fetch full message (headers + body)."""
-        response = httpx.get(
-            f"{BASE_URL}/users/me/messages/{message_id}",
-            params={"format": "full"},
-            headers=self._headers(),
-            timeout=15.0,
-        )
+        """Fetch full message (headers + body).
+
+        Raises:
+            EmailConnectionError: When Gmail can't be reached at the transport
+                level (connect/read failure — not an HTTP error status).
+        """
+        try:
+            response = httpx.get(
+                f"{BASE_URL}/users/me/messages/{message_id}",
+                params={"format": "full"},
+                headers=self._headers(),
+                timeout=15.0,
+            )
+        except _GMAIL_CONNECT_ERRORS as e:
+            logger.error("Gmail unreachable", message_id=message_id, error=str(e))
+            raise EmailConnectionError(_GMAIL_UNREACHABLE) from e
 
         if response.status_code == 401:
             self._flag_reauth()
@@ -297,10 +322,20 @@ class GoogleGmailService:
             snippet=snippet,
             date=date,
             is_unread="UNREAD" in labels,
+            to=headers.get("to", ""),
+            cc=headers.get("cc", ""),
             body=body,
             unsubscribe_url=unsubscribe_url,
             unsubscribe_mailto=unsubscribe_mailto,
             unsubscribe_one_click=unsubscribe_one_click,
+            is_promotional=(
+                "CATEGORY_PROMOTIONS" in labels
+                or "CATEGORY_UPDATES" in labels
+                or parse_bulk_headers(
+                    headers.get("precedence", ""),
+                    headers.get("auto-submitted", ""),
+                )
+            ),
         )
 
     @staticmethod

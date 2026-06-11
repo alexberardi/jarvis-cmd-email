@@ -1,11 +1,21 @@
-"""Resolve which users have a usable mailbox configuration.
+"""Resolve which users the background email agents run for.
 
 ALL mailbox secrets (EMAIL_PROVIDER, IMAP_*, GMAIL_*) are USER-scoped, and
 background agents run with no user in the SDK ContextVar — every
 JarvisStorage user-scope read returns None in agent/discovery context. So
 agents enumerate the user-scope secret rows node-side and check each
 candidate user's credentials explicitly.
+
+On top of that auto-discovery sits the optional EMAIL_AGENT_USER identity
+(integration scope, value_type "user" — the mobile app renders a
+household-member picker and stores the selected member's user id as a
+string): when set, the agents run as and notify exactly that user, so a
+multi-user household never gets notifications fanned to everyone or to the
+wrong person. An EXPLICIT identity must never silently fall back to other
+users — a misconfigured value means the agents idle (with a warning).
 """
+
+from collections.abc import Callable
 
 try:
     from jarvis_log_client import JarvisLogger
@@ -13,6 +23,13 @@ try:
 except ImportError:
     import logging
     logger = logging.getLogger("jarvis-cmd-email")
+
+from jarvis_command_sdk import JarvisStorage
+
+# Integration scope — readable in agent context (no ambient user required).
+_storage = JarvisStorage("email")
+
+AGENT_USER_KEY = "EMAIL_AGENT_USER"
 
 # Any of these rows existing for a user marks them as a mailbox candidate.
 _CANDIDATE_KEYS = {"EMAIL_PROVIDER", "IMAP_USERNAME", "GMAIL_ACCESS_TOKEN"}
@@ -50,3 +67,55 @@ def find_configured_user_ids() -> list[int]:
     except Exception as e:  # never raise from agent discovery
         logger.warning("Email mailbox user resolution failed", error=str(e))
         return []
+
+
+def configured_agent_user_id() -> int | None:
+    """The explicit EMAIL_AGENT_USER identity as an int, or None.
+
+    None when the secret is unset/blank OR doesn't parse as a user id —
+    callers use this only for TARGETING (e.g. the connection-outage notice);
+    whether the agents run at all is resolve_agent_user_ids()'s call.
+    """
+    raw = (_storage.get_secret(AGENT_USER_KEY) or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def resolve_agent_user_ids(
+    configured: Callable[[], list[int]] | None = None,
+) -> list[int]:
+    """User ids the background agents should run for.
+
+    EMAIL_AGENT_USER set → exactly that user, and ONLY when they have a
+    configured mailbox: an explicit identity must never silently fall back
+    to other users, so an unparseable value or one without a mailbox means
+    [] (agents idle) plus a warning. Unset/blank → the existing auto
+    behavior, every mailbox-configured user — zero-config single-user
+    households are unchanged.
+
+    ``configured`` overrides the mailbox lookup; the agents pass their own
+    module-level ``find_configured_user_ids`` reference so tests that patch
+    it on the agent module keep working.
+    """
+    lookup = configured if configured is not None else find_configured_user_ids
+    raw = (_storage.get_secret(AGENT_USER_KEY) or "").strip()
+    if not raw:
+        return lookup()
+    try:
+        uid = int(raw)
+    except ValueError:
+        logger.warning(
+            f"EMAIL_AGENT_USER is set to {raw!r} but that isn't a user id — agents idle"
+        )
+        return []
+    if uid in lookup():
+        return [uid]
+    logger.warning(
+        f"EMAIL_AGENT_USER is set to {uid} but that user has no configured "
+        "mailbox — agents idle"
+    )
+    return []

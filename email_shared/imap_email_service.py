@@ -24,11 +24,19 @@ except ImportError:
     logger = logging.getLogger("jarvis-cmd-email")
 
 from .email_message import (
+    EmailConnectionError,
     EmailMessage,
     extract_email,
     extract_name,
+    parse_bulk_headers,
     parse_unsubscribe_headers,
 )
+
+# Connection-class failures during IMAP connect/STARTTLS/login. OSError covers
+# socket.error, ConnectionRefusedError, and ssl errors; imaplib.IMAP4.error
+# covers protocol-level failures (abort subclasses error) including the EOF
+# aborts the Proton Bridge produces when it's down.
+_IMAP_CONNECT_ERRORS = (OSError, EOFError, imaplib.IMAP4.error)
 
 
 class ImapEmailService:
@@ -45,6 +53,7 @@ class ImapEmailService:
         use_ssl: bool = False,
         archive_folder: str = "Archive",
         trash_folder: str = "Trash",
+        provider: str = "",
     ) -> None:
         self.imap_host = imap_host
         self.imap_port = imap_port
@@ -55,18 +64,45 @@ class ImapEmailService:
         self.use_ssl = use_ssl
         self.archive_folder = archive_folder
         self.trash_folder = trash_folder
+        self.provider = provider
 
     # -- IMAP connection --------------------------------------------------------
 
+    def _server_label(self) -> str:
+        """Human name for the mail server, spoken in connection errors."""
+        if self.provider == "proton":
+            return "the Proton Mail Bridge"
+        return "the email server"
+
+    def _connection_error(self, host: str, port: int) -> EmailConnectionError:
+        return EmailConnectionError(
+            f"Couldn't connect to {self._server_label()} at {host}:{port}"
+        )
+
     def _connect_imap(self) -> imaplib.IMAP4 | imaplib.IMAP4_SSL:
-        """Open an authenticated IMAP connection."""
-        if self.use_ssl:
-            conn = imaplib.IMAP4_SSL(self.imap_host, self.imap_port)
-        else:
-            conn = imaplib.IMAP4(self.imap_host, self.imap_port)
-            conn.starttls()
-        conn.login(self.username, self.password)
-        return conn
+        """Open an authenticated IMAP connection.
+
+        Raises:
+            EmailConnectionError: On connection-class failures (socket refused,
+                EOF, protocol abort, STARTTLS/login failure). These must be
+                SAID, never collapsed into an empty result.
+        """
+        try:
+            if self.use_ssl:
+                conn = imaplib.IMAP4_SSL(self.imap_host, self.imap_port)
+            else:
+                conn = imaplib.IMAP4(self.imap_host, self.imap_port)
+                conn.starttls()
+            conn.login(self.username, self.password)
+            return conn
+        except _IMAP_CONNECT_ERRORS as e:
+            logger.error(
+                "IMAP connection failed",
+                host=self.imap_host,
+                port=self.imap_port,
+                error=str(e),
+            )
+            raise self._connection_error(self.imap_host, self.imap_port) from e
 
     # -- Search / List ----------------------------------------------------------
 
@@ -117,6 +153,8 @@ class ImapEmailService:
                     conn.logout()
                 except Exception:
                     pass
+        except EmailConnectionError:
+            raise  # connection failures must surface, never read as "no mail"
         except Exception as e:
             logger.error("IMAP search failed", error=str(e))
             return []
@@ -145,6 +183,8 @@ class ImapEmailService:
                     conn.logout()
                 except Exception:
                     pass
+        except EmailConnectionError:
+            raise
         except Exception as e:
             logger.error("Failed to fetch IMAP message", message_id=message_id, error=str(e))
             return None
@@ -217,6 +257,8 @@ class ImapEmailService:
                     conn.logout()
                 except Exception:
                     pass
+        except EmailConnectionError:
+            raise
         except Exception as e:
             logger.error("Failed to archive IMAP message", message_id=message_id, error=str(e))
             return False
@@ -239,6 +281,8 @@ class ImapEmailService:
                     conn.logout()
                 except Exception:
                     pass
+        except EmailConnectionError:
+            raise
         except Exception as e:
             logger.error("Failed to trash IMAP message", message_id=message_id, error=str(e))
             return False
@@ -275,16 +319,45 @@ class ImapEmailService:
                     conn.logout()
                 except Exception:
                     pass
+        except EmailConnectionError:
+            raise
         except Exception as e:
             logger.error("Failed to set IMAP flag", message_id=message_id, flag=flag, error=str(e))
             return False
 
     def _smtp_send(self, msg: MIMEText) -> None:
-        """Send a MIME message via SMTP with STARTTLS."""
-        with smtplib.SMTP(self.smtp_host, self.smtp_port) as smtp:
-            smtp.starttls()
-            smtp.login(self.username, self.password)
-            smtp.send_message(msg)
+        """Send a MIME message via SMTP with STARTTLS.
+
+        Raises:
+            EmailConnectionError: When the SMTP server can't be reached or the
+                connection drops (smtplib's exceptions subclass OSError).
+        """
+        try:
+            with smtplib.SMTP(self.smtp_host, self.smtp_port) as smtp:
+                smtp.starttls()
+                smtp.login(self.username, self.password)
+                smtp.send_message(msg)
+        except (smtplib.SMTPConnectError, smtplib.SMTPServerDisconnected) as e:
+            logger.error(
+                "SMTP connection failed",
+                host=self.smtp_host,
+                port=self.smtp_port,
+                error=str(e),
+            )
+            raise self._connection_error(self.smtp_host, self.smtp_port) from e
+        except smtplib.SMTPException:
+            # Protocol-level failures (auth, recipients refused, …) are not
+            # connection problems — keep today's behavior and propagate as-is.
+            raise
+        except (OSError, EOFError) as e:
+            # Bare socket failures (connection refused, network unreachable).
+            logger.error(
+                "SMTP connection failed",
+                host=self.smtp_host,
+                port=self.smtp_port,
+                error=str(e),
+            )
+            raise self._connection_error(self.smtp_host, self.smtp_port) from e
 
     def _fetch_envelope(self, conn: imaplib.IMAP4, uid: bytes) -> EmailMessage | None:
         """Fetch headers + snippet for a single message by UID (lightweight)."""
@@ -328,6 +401,8 @@ class ImapEmailService:
             snippet=snippet,
             date=date,
             is_unread=is_unread,
+            to=str(msg.get("To", "") or ""),
+            cc=str(msg.get("Cc", "") or ""),
         )
 
     def _parse_message(
@@ -367,10 +442,17 @@ class ImapEmailService:
             snippet=snippet,
             date=date,
             is_unread=is_unread,
+            to=str(msg.get("To", "") or ""),
+            cc=str(msg.get("Cc", "") or ""),
             body=body,
             unsubscribe_url=unsubscribe_url,
             unsubscribe_mailto=unsubscribe_mailto,
             unsubscribe_one_click=unsubscribe_one_click,
+            # No category labels over IMAP — bulk headers only.
+            is_promotional=parse_bulk_headers(
+                str(msg.get("Precedence", "") or ""),
+                str(msg.get("Auto-Submitted", "") or ""),
+            ),
         )
 
     @staticmethod

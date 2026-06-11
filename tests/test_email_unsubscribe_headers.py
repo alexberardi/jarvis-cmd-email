@@ -163,6 +163,35 @@ class TestGmailUnsubscribeParsing:
         assert msg.unsubscribe_one_click is False
 
 
+class TestGmailPromotionalSignal:
+    def test_category_promotions_label(self, gmail):
+        raw = _gmail_raw()
+        raw["labelIds"] = ["UNREAD", "INBOX", "CATEGORY_PROMOTIONS"]
+        assert gmail._parse_message(raw).is_promotional is True
+
+    def test_category_updates_label(self, gmail):
+        # The marketplace-messages@ incident class: no unsubscribe headers,
+        # human-looking address — Gmail's Updates category is the signal.
+        raw = _gmail_raw()
+        raw["labelIds"] = ["UNREAD", "INBOX", "CATEGORY_UPDATES"]
+        assert gmail._parse_message(raw).is_promotional is True
+
+    def test_precedence_bulk_header(self, gmail):
+        raw = _gmail_raw([{"name": "Precedence", "value": "bulk"}])
+        assert gmail._parse_message(raw).is_promotional is True
+
+    def test_auto_submitted_header(self, gmail):
+        raw = _gmail_raw([{"name": "Auto-Submitted", "value": "auto-generated"}])
+        assert gmail._parse_message(raw).is_promotional is True
+
+    def test_auto_submitted_no_is_not_promotional(self, gmail):
+        raw = _gmail_raw([{"name": "Auto-Submitted", "value": "no"}])
+        assert gmail._parse_message(raw).is_promotional is False
+
+    def test_plain_personal_mail_is_not_promotional(self, gmail):
+        assert gmail._parse_message(_gmail_raw()).is_promotional is False
+
+
 # ── IMAP _parse_message ──────────────────────────────────────────────────────
 
 
@@ -214,3 +243,21 @@ class TestImapUnsubscribeParsing:
         assert msg.unsubscribe_url == ""
         assert msg.unsubscribe_mailto == ""
         assert msg.unsubscribe_one_click is False
+
+
+class TestImapPromotionalSignal:
+    def test_precedence_bulk_marks_promotional(self, imap):
+        msg = imap._parse_message(
+            _imap_message("Precedence: bulk\r\n"), "7", b"FLAGS ()"
+        )
+        assert msg.is_promotional is True
+
+    def test_auto_submitted_marks_promotional(self, imap):
+        msg = imap._parse_message(
+            _imap_message("Auto-Submitted: auto-replied\r\n"), "7", b"FLAGS ()"
+        )
+        assert msg.is_promotional is True
+
+    def test_plain_mail_is_not_promotional(self, imap):
+        msg = imap._parse_message(_imap_message(), "7", b"FLAGS ()")
+        assert msg.is_promotional is False

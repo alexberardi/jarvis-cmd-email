@@ -1,8 +1,11 @@
 name: "email"
 display_name: "Email (Gmail & IMAP)"
 description: "Full email management — list, read, search, send, reply, archive, trash, and star. Supports Gmail (OAuth) and IMAP/SMTP (Proton Mail, Yahoo, etc.). Includes VIP alerts and daily digest agent."
-version: "1.0.2"
-min_jarvis_version: "0.9.0"
+version: "1.0.3"
+min_jarvis_version: "0.1.114"
+# Floors enforced at install since node v0.1.114. This package needs the SDK's
+# JarvisInbox (0.3.3) and JarvisSecret value_type "user" (0.3.4).
+min_sdk_version: "0.3.4"
 license: "MIT"
 author:
   github: "alexberardi"
@@ -107,5 +110,10 @@ secrets:
   - key: EMAIL_NOTIFICATION_FILTER
     scope: integration
     value_type: string
-    description: "Free-text rule for which emails deserve a drafted reply (e.g. 'clients, invoices, anything from my kid's school'). Leave blank to disable smart replies."
+    description: "Free-text instructions for which emails deserve a drafted reply (e.g. 'clients, invoices, anything from my kid's school'). Applied ON TOP of the built-in rules: real humans only, addressed to you directly, and the email actually warrants a response. Leave blank to disable smart replies."
+    is_sensitive: false
+  - key: EMAIL_AGENT_USER
+    scope: integration
+    value_type: user
+    description: "The household member this agent runs as and notifies. Leave unset to run for every member with a configured mailbox."
     is_sensitive: false

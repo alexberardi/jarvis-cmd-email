@@ -40,7 +40,7 @@ from jarvis_command_sdk import (
     callback,
 )
 
-from email_shared.email_message import EmailMessage, extract_email
+from email_shared.email_message import EmailConnectionError, EmailMessage, extract_email
 from email_shared.email_service_factory import create_email_service, get_email_provider
 from email_shared.triage import build_triage_body, build_triage_payload
 
@@ -836,6 +836,9 @@ class EmailCommand(IJarvisCommand):
                     "message": "Email sent successfully.",
                 }
             )
+        except EmailConnectionError as e:
+            logger.error("Email send hit connection failure", error=str(e))
+            return self._connection_failure_response(e)
         except Exception as e:
             logger.error("Email send failed", error=str(e))
             return CommandResponse.error_response(error_details=str(e))
@@ -894,12 +897,27 @@ class EmailCommand(IJarvisCommand):
                 return CommandResponse.error_response(
                     error_details=f"Unknown email action: {action}"
                 )
+        except EmailConnectionError as e:
+            # Connection failures must be SAID, not read as "no unread emails".
+            # context_data["message"] is always set so pre-routed paths (no LLM
+            # downstream) speak it instead of silently falling through.
+            logger.error("email server unreachable", action=action, error=str(e))
+            return self._connection_failure_response(e)
         except Exception as e:
             logger.error("email command failed", action=action, error=str(e))
             return CommandResponse.error_response(
                 error_details=str(e),
                 context_data={"error": str(e)},
             )
+
+    @staticmethod
+    def _connection_failure_response(e: EmailConnectionError) -> CommandResponse:
+        """Spoken-friendly error for an unreachable mail server."""
+        message = f"I couldn't reach your email. {e.description}."
+        return CommandResponse.error_response(
+            error_details=str(e),
+            context_data={"error": str(e), "message": message},
+        )
 
     # -- Action implementations -------------------------------------------------
 
@@ -1504,6 +1522,14 @@ class EmailCommand(IJarvisCommand):
         for key in keys:
             try:
                 ok = bool(apply_verb(key))
+            except EmailConnectionError as e:
+                # The server is down — every remaining key would fail the same
+                # way. Return a clean error instead of raising or grinding on.
+                logger.error("email triage verb hit connection failure", verb=verb, error=str(e))
+                return CommandResponse.error_response(
+                    error_details=str(e),
+                    context_data={"message": f"I couldn't reach your email. {e.description}."},
+                )
             except Exception as e:
                 logger.error("email triage verb failed", verb=verb, message_id=key, error=str(e))
                 ok = False
@@ -1655,6 +1681,12 @@ class EmailCommand(IJarvisCommand):
 
         try:
             service.reply(message_id, thread_id, body)
+        except EmailConnectionError as e:
+            logger.error("smart reply send hit connection failure", error=str(e))
+            return CommandResponse.error_response(
+                error_details=str(e),
+                context_data={"message": f"I couldn't send the reply. {e.description}."},
+            )
         except Exception as e:
             logger.error("smart reply send failed", message_id=message_id, error=str(e))
             return CommandResponse.error_response(

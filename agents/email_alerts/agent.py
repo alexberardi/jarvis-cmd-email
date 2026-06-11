@@ -2,13 +2,21 @@
 
 Runs every 5 minutes. Iterates the mailbox-configured users (mailbox secrets
 are user-scoped, and agents have no ambient user — see
-email_shared.user_resolution) and, with the SDK user ContextVar set to each
-user in turn, fetches recent unread emails and generates alerts based on
-three behaviors:
-- VIP senders (priority 3) — configurable email list
-- Urgent keywords (priority 2) — subject/snippet keyword matching
-- Daily digest (priority 1) — morning summary of unread count + top senders,
-  posted per user, once per day each
+email_shared.user_resolution; the optional EMAIL_AGENT_USER identity pins
+the agent to ONE household member instead, and targets the outage notice at
+them) and, with the SDK user ContextVar set to each user in turn, fetches
+recent unread emails and reacts to three triggers:
+
+- VIP senders / urgent keywords — posted as drafted inbox+push reply items
+  via the shared email_shared.reply_drafts surface (same one the smart_reply
+  agent uses). KEY ASYMMETRY vs the smart_reply filter path: these triggers
+  are deterministic, so the item posts even when no draft could be generated
+  (LLM down, or the model says no reply is warranted) — the draft is
+  enrichment, never a gate. Dedup is the PERSISTENT shared namespace, so the
+  filter path and this path can never double-post the same message.
+- Daily digest — morning interactive triage list per user, once per day each,
+  with the legacy text-Alert fallback when the inbox post fails (get_alerts()
+  still serves that fallback).
 
 Does not run on startup to let TokenRefreshAgent warm up Gmail tokens first.
 """
@@ -36,17 +44,30 @@ from jarvis_command_sdk import (
     set_current_user_id,
 )
 
-from email_shared.email_message import extract_email
+from email_shared.connection_health import record_success, report_connection_failure
+from email_shared.email_message import EmailConnectionError, extract_email
 from email_shared.email_service_factory import create_email_service, get_email_provider
+from email_shared.reply_drafts import (
+    already_posted,
+    generate_reply_draft,
+    mark_posted,
+    post_reply_item,
+)
+from email_shared.reply_rubric import is_direct_recipient, resolve_user_address
+from email_shared.senders import is_bulk_sender
 from email_shared.triage import build_triage_body, build_triage_payload
-from email_shared.user_resolution import find_configured_user_ids
+from email_shared.user_resolution import (
+    configured_agent_user_id,
+    find_configured_user_ids,
+    resolve_agent_user_ids,
+)
 
 _storage = JarvisStorage("email_alerts")
 
 REFRESH_INTERVAL_SECONDS = 300  # 5 minutes
 ALERT_TTL_HOURS = 8
 MAX_ALERTS_PER_RUN = 5
-MAX_DEDUP_CACHE = 200
+MAX_REPLY_POSTS_PER_RUN = 3  # VIP + urgent combined, across all users per run
 MAX_USERS_PER_RUN = 5
 
 DEFAULT_URGENT_KEYWORDS: set[str] = {
@@ -65,7 +86,6 @@ class EmailAlertAgent(IJarvisAgent):
 
     def __init__(self) -> None:
         self._alerts: List[Alert] = []
-        self._alerted_email_ids: set[str] = set()  # "{uid}:{email_id}" entries
         # Per-user digest guard: uid → ISO date string, e.g. "2026-03-15"
         self._last_digest_date: dict[int, str] = {}
         self._vip_senders: set[str] = set()  # cached from secrets
@@ -115,6 +135,16 @@ class EmailAlertAgent(IJarvisAgent):
                 is_sensitive=False,
                 friendly_name="Digest Hour",
             ),
+            JarvisSecret(
+                "EMAIL_AGENT_USER",
+                "The household member this agent runs as and notifies. "
+                "Leave unset to run for every member with a configured mailbox.",
+                "integration",
+                "user",
+                required=False,
+                is_sensitive=False,
+                friendly_name="Notify user",
+            ),
         ]
 
     def validate_secrets(self) -> List[str]:
@@ -148,34 +178,51 @@ class EmailAlertAgent(IJarvisAgent):
         return False
 
     async def run(self) -> None:
-        """Fetch recent unread emails and generate alerts, per configured user."""
+        """Fetch recent unread emails and react to triggers, per configured user."""
         try:
-            user_ids = find_configured_user_ids()
+            # The module-level find_configured_user_ids is passed explicitly
+            # so the EMAIL_AGENT_USER identity check sees the same lookup
+            # tests patch on this module.
+            user_ids = resolve_agent_user_ids(find_configured_user_ids)
             if not user_ids:
                 logger.debug("Email alert agent: no users with a configured mailbox")
                 self._alerts = []
                 return
 
             all_alerts: List[Alert] = []
+            reply_budget = MAX_REPLY_POSTS_PER_RUN
+            outage: str | None = None
+            reachable = False
             for uid in user_ids[:MAX_USERS_PER_RUN]:
                 # Set the SDK user ContextVar so create_email_service() (and
                 # every other user-scope secret read) resolves this user's
                 # mailbox credentials.
                 set_current_user_id(uid)
                 try:
-                    all_alerts.extend(self._run_for_user(uid))
+                    alerts, posted, failure, ok = self._run_for_user(
+                        uid, reply_budget
+                    )
+                    all_alerts.extend(alerts)
+                    reply_budget -= posted
+                    if failure is not None:
+                        outage = failure
+                    elif ok:
+                        reachable = True
                 finally:
                     set_current_user_id(None)
 
-            self._alerts = self._apply_rate_limit(all_alerts)
+            # Per-TICK health aggregation — the tracker is called AT MOST
+            # once per tick so N broken mailboxes are one failure (the
+            # debounce threshold means ticks, not users) and a healthy
+            # mailbox can never clear a broken mailbox's failure streak.
+            # With an explicit EMAIL_AGENT_USER identity the outage notice
+            # targets that user; otherwise it stays household-wide.
+            if outage is not None:
+                report_connection_failure(outage, user_id=configured_agent_user_id())
+            elif reachable:
+                record_success()
 
-            # Trim dedup cache
-            if len(self._alerted_email_ids) > MAX_DEDUP_CACHE:
-                # Keep the most recent entries (arbitrary trim)
-                excess = len(self._alerted_email_ids) - MAX_DEDUP_CACHE
-                to_remove = list(self._alerted_email_ids)[:excess]
-                for item in to_remove:
-                    self._alerted_email_ids.discard(item)
+            self._alerts = self._apply_rate_limit(all_alerts)
 
             if self._alerts:
                 logger.info("Email agent generated alerts", count=len(self._alerts))
@@ -184,17 +231,34 @@ class EmailAlertAgent(IJarvisAgent):
             logger.error("Email alert agent run failed", error=str(e))
             self._alerts = []
 
-    def _run_for_user(self, uid: int) -> List[Alert]:
+    def _run_for_user(
+        self, uid: int, reply_budget: int
+    ) -> tuple[List[Alert], int, str | None, bool]:
         """VIP / urgent / digest checks for one user's mailbox.
 
-        Caller has already set the SDK user ContextVar to ``uid``.
+        Caller has already set the SDK user ContextVar to ``uid``. Returns
+        ``(digest_alerts, reply_posts_made, connection_failure, reachable)``
+        — VIP/urgent matches post inbox items directly (never Alerts); only
+        the digest fallback still emits Alerts. The connection outcome feeds
+        run()'s per-tick health aggregation instead of hitting the tracker
+        directly (one broken mailbox among N must not be masked or
+        multiply-counted): ``connection_failure`` is the failure description,
+        ``reachable`` is True only when the mailbox was actually probed
+        successfully; both are falsy when no service could be constructed
+        (neutral — nothing was probed).
         """
         try:
             service = create_email_service()
         except ValueError:
-            return []
+            return [], 0, None, False
 
-        emails = service.search("is:unread in:inbox newer_than:1d", max_results=20)
+        try:
+            emails = service.search("is:unread in:inbox newer_than:1d", max_results=20)
+        except EmailConnectionError as e:
+            # Mailbox unreachable — must never read as "no unread mail".
+            # Swallowing here keeps the scheduler's 3-strike auto-disable
+            # from tripping so we keep probing every tick.
+            return [], 0, e.description, False
 
         # Load config from secrets (integration scope — shared across users)
         vip_senders = self._load_vip_senders()
@@ -202,18 +266,86 @@ class EmailAlertAgent(IJarvisAgent):
         digest_hour = self._load_digest_hour()
 
         now = datetime.now(timezone.utc)
-        alerts: List[Alert] = []
 
-        for email in emails:
-            # VIP check first (higher priority)
-            alerts.extend(self._check_vip(email, vip_senders, uid))
-
-            # Urgent keyword check (skips already-alerted emails)
-            alerts.extend(self._check_urgent(email, urgent_keywords, uid))
+        # VIP first, then urgent — posted as drafted reply items.
+        posted = self._post_reply_items(
+            uid, service, emails, vip_senders, urgent_keywords, reply_budget
+        )
 
         # Daily digest (per user, once per day each)
-        alerts.extend(self._check_digest(emails, digest_hour, now, uid))
-        return alerts
+        return self._check_digest(emails, digest_hour, now, uid), posted, None, True
+
+    def _post_reply_items(
+        self,
+        uid: int,
+        service: Any,
+        emails: list[Any],
+        vip_senders: set[str],
+        urgent_keywords: set[str],
+        budget: int,
+    ) -> int:
+        """Post VIP/urgent matches as drafted inbox+push items. Returns posts made.
+
+        VIP matches are processed first, then urgent; an email matching both
+        is posted once (as VIP). KEY ASYMMETRY vs the smart_reply filter
+        path: these are deterministic triggers, so the item posts even when
+        ``generate_reply_draft`` produced nothing (LLM down / no reply
+        warranted) — the draft is enrichment, never a gate. Urgent matches
+        only get the draft attempt when the sender is not bulk
+        (email_shared.senders) AND the user is a direct recipient
+        (email_shared.reply_rubric) — otherwise they post with draft=None
+        forced: never draft a reply to a no-reply/marketing sender or to
+        mail where the user is merely CC'd. VIPs are user-listed and skip
+        ALL screens (stage-2 should_reply still applies inside the draft
+        call). Dedup (shared with smart_reply) is marked only on a
+        successful post, so failed posts retry next tick.
+        """
+        vip = [e for e in emails if self._check_vip(e, vip_senders)]
+        vip_ids = {e.id for e in vip}
+        urgent = [
+            e for e in emails
+            if e.id not in vip_ids and self._check_urgent(e, urgent_keywords)
+        ]
+
+        queue = [(e, f"Email from {e.sender_name}", "vip") for e in vip] + [
+            (e, f"Urgent: {e.subject}", "urgent") for e in urgent
+        ]
+
+        # Caller holds the per-uid ContextVar, so user scope resolves here.
+        user_address = resolve_user_address()
+
+        posted = 0
+        for email, title, reason in queue:
+            if posted >= budget:
+                break
+            if already_posted(uid, email.id):
+                continue
+            # VIP senders are explicitly user-listed — they skip ALL screens.
+            # Urgent-keyword matches still post (an automated fraud alert
+            # from noreply@bank must not be lost) but draft=None is forced —
+            # skipping the draft LLM entirely — when the sender is bulk OR
+            # the user isn't a direct recipient (only CC'd / list blast).
+            if reason == "urgent" and (
+                is_bulk_sender(email)
+                or not is_direct_recipient(email, user_address)
+            ):
+                draft = None
+            else:
+                # Guarded: every failure mode (LLM down, fetch failure, no
+                # reply warranted) yields draft=None — the post still happens.
+                draft = generate_reply_draft(service, email)
+            tag = post_reply_item(uid, email, draft, title=title, reason=reason)
+            if tag == "ok":
+                mark_posted(uid, email.id)
+                posted += 1
+            else:
+                logger.warning(
+                    "Email alert reply post failed — will retry next run",
+                    reason=tag,
+                    trigger=reason,
+                    message_id=email.id,
+                )
+        return posted
 
     def _load_vip_senders(self) -> set[str]:
         """Load VIP sender list from secrets, falling back to cached value."""
@@ -243,52 +375,16 @@ class EmailAlertAgent(IJarvisAgent):
                 pass
         return 7
 
-    def _check_vip(self, email: Any, vip_senders: set[str], uid: int) -> List[Alert]:
-        """Check if email is from a VIP sender. Returns 0 or 1 alerts."""
+    def _check_vip(self, email: Any, vip_senders: set[str]) -> bool:
+        """True when the email's sender is on the VIP list."""
         if not vip_senders:
-            return []
+            return False
+        return extract_email(email.sender).lower() in vip_senders
 
-        if f"{uid}:{email.id}" in self._alerted_email_ids:
-            return []
-
-        sender_email = extract_email(email.sender).lower()
-        if sender_email not in vip_senders:
-            return []
-
-        now = datetime.now(timezone.utc)
-        self._alerted_email_ids.add(f"{uid}:{email.id}")
-
-        return [Alert(
-            source_agent=self.name,
-            title=f"Email from {email.sender_name}",
-            summary=f"{email.sender_name}: {email.subject}",
-            created_at=now,
-            expires_at=now + timedelta(hours=ALERT_TTL_HOURS),
-            priority=3,
-        )]
-
-    def _check_urgent(self, email: Any, keywords: set[str], uid: int) -> List[Alert]:
-        """Check if email subject/snippet contains urgent keywords. Returns 0 or 1 alerts."""
-        if f"{uid}:{email.id}" in self._alerted_email_ids:
-            return []
-
+    def _check_urgent(self, email: Any, keywords: set[str]) -> bool:
+        """True when the email subject/snippet contains an urgent keyword."""
         text = f"{email.subject} {email.snippet}".lower()
-        matched = any(kw in text for kw in keywords)
-
-        if not matched:
-            return []
-
-        now = datetime.now(timezone.utc)
-        self._alerted_email_ids.add(f"{uid}:{email.id}")
-
-        return [Alert(
-            source_agent=self.name,
-            title=f"Urgent: {email.subject}",
-            summary=f"From {email.sender_name}: {email.subject}",
-            created_at=now,
-            expires_at=now + timedelta(hours=ALERT_TTL_HOURS),
-            priority=2,
-        )]
+        return any(kw in text for kw in keywords)
 
     def _check_digest(
         self, emails: list[Any], digest_hour: int, now: datetime, uid: int
