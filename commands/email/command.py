@@ -38,6 +38,7 @@ from jarvis_command_sdk import (
     PreRouteResult,
     RequestInformation,
     callback,
+    get_current_user_id,
 )
 
 from email_shared.email_message import EmailConnectionError, EmailMessage, extract_email
@@ -504,10 +505,23 @@ class EmailCommand(IJarvisCommand):
         )
 
     def store_auth_values(self, values: dict[str, str]) -> None:
+        """Store Gmail OAuth tokens from the mobile OAuth callback.
+
+        Tokens are user-scoped — the caller (node auth pull / token refresh
+        agent) sets the SDK user ContextVar to the token owner. Without an
+        owner there is no correct row to write, so refuse loudly rather than
+        store tokens nobody can read.
+        """
+        if get_current_user_id() is None:
+            logger.error(
+                "Refusing to store Gmail tokens: no user in context "
+                "(requires CC with OAuth user threading — update jarvis-command-center)"
+            )
+            return
         if "access_token" in values:
-            self._storage.set_secret("GMAIL_ACCESS_TOKEN", values["access_token"])
+            self._storage.set_secret("GMAIL_ACCESS_TOKEN", values["access_token"], scope="user")
         if "refresh_token" in values:
-            self._storage.set_secret("GMAIL_REFRESH_TOKEN", values["refresh_token"])
+            self._storage.set_secret("GMAIL_REFRESH_TOKEN", values["refresh_token"], scope="user")
         try:
             from services.command_auth_service import clear_auth_flag
             clear_auth_flag("google_gmail")
