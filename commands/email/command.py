@@ -41,6 +41,14 @@ from jarvis_command_sdk import (
     get_current_user_id,
 )
 
+# ReferenceableItem ships in jarvis-command-sdk >= 0.4.0 and powers the voice
+# follow-up ("mark those as read"). Import defensively so the command still
+# loads on an older node — it just won't offer the voice follow-up there.
+try:
+    from jarvis_command_sdk import ReferenceableItem
+except ImportError:  # pragma: no cover - only hit on pre-0.4.0 nodes
+    ReferenceableItem = None
+
 from email_shared.email_message import EmailConnectionError, EmailMessage, extract_email
 from email_shared.email_service_factory import create_email_service, get_email_provider
 from email_shared.triage import build_triage_body, build_triage_payload
@@ -975,7 +983,34 @@ class EmailCommand(IJarvisCommand):
                 ctx["message"] = (
                     f"You have {len(emails)} unread email{'s' if len(emails) != 1 else ''}. {top}{rest}."
                 )
-        return CommandResponse.follow_up_response(context_data=ctx)
+        resp = CommandResponse.follow_up_response(context_data=ctx)
+        # Let the user act on these by voice ("mark those as read") via the
+        # generic act_on_items tool → our mark_read @callback below.
+        resp.referenceable_items = self._build_referenceable_items(emails)
+        return resp
+
+    def _build_referenceable_items(self, emails: list[EmailMessage]):
+        """Build voice-followup items for the just-listed emails.
+
+        ``ref_id`` is the stable Gmail/IMAP message id; the ``mark_read``
+        @callback below acts on them via the same path as the mobile triage
+        button. Returns None on a pre-0.4.0 node (ReferenceableItem absent) so
+        the listing still works, just without the spoken follow-up.
+        """
+        if ReferenceableItem is None or not emails:
+            return None
+        items = []
+        for e in emails:
+            label = f"{e.sender_name}: {e.subject}".strip().rstrip(":") or (e.subject or "(no subject)")
+            items.append(
+                ReferenceableItem(
+                    ref_id=e.id,
+                    label=label,
+                    attrs={"sender": e.sender_name, "subject": e.subject},
+                    actions=["mark_read"],
+                )
+            )
+        return items
 
     def _run_read(self, request_info: RequestInformation, **kwargs: Any) -> CommandResponse:
         email_index: int | None = kwargs.get("email_index")
@@ -1487,6 +1522,17 @@ class EmailCommand(IJarvisCommand):
         )
 
     # ── Triage callbacks: mobile checked emails, apply the chosen verb ─────
+
+    @callback("mark_read")
+    def mark_read(self, data: dict, request_info: RequestInformation) -> CommandResponse:
+        """Voice follow-up: mark the referenced emails read ("mark those as read").
+
+        Fired by the node's act_on_items dispatch with the same
+        ``{action, selected: [{key: message_id}], context}`` shape a mobile
+        triage tap sends — so it reuses ``_apply_triage`` verbatim. One handler,
+        both surfaces.
+        """
+        return self._apply_triage("mark_read", data)
 
     @callback("triage_mark_read")
     def triage_mark_read(self, data: dict, request_info: RequestInformation) -> CommandResponse:
