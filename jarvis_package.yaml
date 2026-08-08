@@ -24,6 +24,9 @@ components:
   - type: agent
     name: smart_reply
     path: agents/smart_reply/agent.py
+  - type: agent
+    name: appointment_scan
+    path: agents/appointment_scan/agent.py
 
 packages:
   - name: httpx
