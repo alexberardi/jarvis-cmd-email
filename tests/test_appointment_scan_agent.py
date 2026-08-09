@@ -229,6 +229,16 @@ def _confirm_element(call: dict) -> dict:
     return call["metadata"]["interactive_elements"][0]
 
 
+def _install_fake_proposal_client(monkeypatch, signals: dict) -> None:
+    """Make `from services.proposal_client import get_suppression_signals` resolve."""
+    services_mod = sys.modules.get("services") or types.ModuleType("services")
+    monkeypatch.setitem(sys.modules, "services", services_mod)
+    pc = types.ModuleType("services.proposal_client")
+    pc.get_suppression_signals = lambda command, user_id: signals  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "services.proposal_client", pc)
+    services_mod.proposal_client = pc  # type: ignore[attr-defined]
+
+
 # ── Declaration ──────────────────────────────────────────────────────────────
 
 
@@ -582,3 +592,63 @@ class TestResilience:
         _run(agent)  # must not raise
         assert inbox_backend.calls == []
         assert storage_backend.get("email_appointment_scan", "1:id-1") is None
+
+
+# ── 'Never suggest this again' — blocklist consumption ───────────────────────
+
+
+class TestSuppression:
+    def test_blocked_sender_skipped_before_fetch_and_llm(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        emails = [_make_email(1)]  # sender1@example.com
+        service = _wire_service(monkeypatch, emails)
+        _install_fake_proposal_client(
+            monkeypatch, {"source_keys": ["sender1@example.com"], "descriptors": []}
+        )
+        llm = {"called": False}
+
+        def _ask(prompt, system=None):
+            llm["called"] = True
+            return _appointment_json()
+
+        _install_fake_node_llm_client(monkeypatch, _ask)
+
+        _run(agent)
+
+        assert inbox_backend.calls == []          # no card for a blocked sender
+        assert llm["called"] is False             # skipped before the LLM spend
+        service.fetch_message.assert_not_called()  # and before the fetch
+
+    def test_descriptors_injected_into_extraction_prompt(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        _wire_service(monkeypatch, [_make_email(2)])
+        _install_fake_proposal_client(
+            monkeypatch, {"source_keys": [], "descriptors": ["CI/build-failure notifications"]}
+        )
+        seen = {}
+
+        def _ask(prompt, system=None):
+            seen["system"] = system
+            return _appointment_json(has=False)
+
+        _install_fake_node_llm_client(monkeypatch, _ask)
+
+        _run(agent)
+
+        assert "CI/build-failure notifications" in seen["system"]
+
+    def test_card_carries_suppress_source_and_descriptor(
+        self, agent, storage_backend, inbox_backend, monkeypatch
+    ):
+        _wire_service(monkeypatch, [_make_email(3)])  # sender3@example.com, "Subject 3"
+        _install_fake_proposal_client(monkeypatch, {"source_keys": [], "descriptors": []})
+        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: _appointment_json())
+
+        _run(agent)
+
+        els = inbox_backend.calls[0]["metadata"]["interactive_elements"]
+        suppress = next(e for e in els if e["callback"] == "suppress")
+        assert suppress["data"]["source"] == "sender3@example.com"
+        assert "Subject 3" in suppress["data"]["descriptor"]

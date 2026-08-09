@@ -61,7 +61,7 @@ from jarvis_command_sdk import (
     set_current_user_id,
 )
 
-from email_shared.email_message import EmailConnectionError
+from email_shared.email_message import EmailConnectionError, extract_email
 from email_shared.email_service_factory import create_email_service, get_email_provider
 from email_shared.reply_drafts import strip_llm_noise
 from email_shared.user_resolution import (
@@ -223,9 +223,18 @@ class AppointmentScanAgent(IJarvisAgent):
             logger.warning("Appointment scan: search failed", error=e.description)
             return 0
 
-        # Persistent dedup screen BEFORE any fetch/LLM — a message we already
-        # proposed (or fully scanned) this week never gets re-fetched.
-        candidates = [e for e in emails if not self._already_seen(uid, e.id)]
+        # 'Never suggest this again' blocklist for this user (fail-open on fetch).
+        signals = self._fetch_suppression_signals(uid)
+        blocked_sources = {s for s in signals.get("source_keys", []) if s}
+        descriptors = signals.get("descriptors", [])
+
+        # Screen BEFORE any fetch/LLM: drop already-seen mail AND mail whose
+        # sender the user has hard-blocked (no fetch, no LLM spend on those).
+        candidates = [
+            e
+            for e in emails
+            if not self._already_seen(uid, e.id) and not self._is_blocked_source(e, blocked_sources)
+        ]
 
         proposed = 0
         for email in candidates:
@@ -240,7 +249,9 @@ class AppointmentScanAgent(IJarvisAgent):
                 break
             if not full:
                 continue  # transient fetch miss — retry next run
-            appt = self._extract_appointment(full)
+            # descriptors are injected as negative examples so the LLM also skips
+            # look-alikes of things the user blocked (not just exact senders).
+            appt = self._extract_appointment(full, descriptors)
             if appt is None:
                 # No appointment (or LLM unreachable). Do NOT mark seen —
                 # extraction is fail-closed, so retry on a later tick.
@@ -260,13 +271,16 @@ class AppointmentScanAgent(IJarvisAgent):
 
     # ── Fail-closed LLM extraction (mirrors reply_drafts.generate_draft_status) ─
 
-    def _extract_appointment(self, email: Any) -> dict[str, str] | None:
+    def _extract_appointment(
+        self, email: Any, descriptors: list[str] | None = None
+    ) -> dict[str, str] | None:
         """Extract a single appointment from one email. ``None`` = no appointment.
 
         Fail-closed: a missing LLM client, an empty/garbled response, a
         non-dict, has_appointment=false, or a result missing a concrete title
         or start all collapse to ``None`` — nothing is ever proposed on a
-        shaky extraction.
+        shaky extraction. ``descriptors`` are the user's 'never suggest this'
+        examples, injected so the LLM also skips look-alikes.
         """
         try:
             from services.node_llm_client import ask_llm
@@ -280,7 +294,17 @@ class AppointmentScanAgent(IJarvisAgent):
             f"{email.body or email.snippet}"
         )
 
-        raw = ask_llm(prompt, system=_EXTRACT_SYSTEM) or ""
+        system = _EXTRACT_SYSTEM
+        if descriptors:
+            blocked = "\n".join(f"- {d}" for d in descriptors[:20])
+            system = (
+                _EXTRACT_SYSTEM
+                + "\n\nThe user has asked you to STOP proposing certain things. If "
+                "this email is one of these — or clearly the same kind — set "
+                f"has_appointment to false:\n{blocked}"
+            )
+
+        raw = ask_llm(prompt, system=system) or ""
         if not raw:
             logger.warning(
                 "Appointment scan: empty LLM response (fail-closed)",
@@ -326,6 +350,11 @@ class AppointmentScanAgent(IJarvisAgent):
     def _propose(self, email: Any, appt: dict[str, str], uid: int) -> str:
         """Post a tap-to-confirm card proposing add_event.create_event. Returns the tag."""
         idempotency_key = f"appt:{email.id}"
+        # 'Never suggest this' inputs: a deterministic source key (the sender's
+        # address) for a hard block, and a semantic descriptor the extractor
+        # injects as a negative example to also skip look-alikes.
+        source = extract_email(email.sender) or (email.sender or "")
+        descriptor = f'appointment emails like "{email.subject}" from {email.sender}'
         return JarvisInbox("appointment_scan").propose_action(
             target_command=TARGET_COMMAND,
             action=TARGET_ACTION,
@@ -342,9 +371,38 @@ class AppointmentScanAgent(IJarvisAgent):
             editable=["title", "start", "end", "location"],
             title="Add to your calendar?",
             summary=email.subject,
+            source=source,
+            descriptor=descriptor,
             user_id=uid,
             create_push_notification=True,
         )
+
+    # ── 'Never suggest this again' blocklist (fetched from command-center) ──────
+
+    def _fetch_suppression_signals(self, uid: int) -> dict:
+        """Fetch this user's blocklist signals for add_event. Fail-open: any
+        error (including the node helper being unavailable) → empty signals, so
+        a fetch miss never stops suggestions."""
+        try:
+            from services.proposal_client import get_suppression_signals
+        except ImportError:
+            return {"source_keys": [], "descriptors": []}
+        try:
+            return get_suppression_signals(TARGET_COMMAND, uid) or {
+                "source_keys": [],
+                "descriptors": [],
+            }
+        except Exception as e:  # noqa: BLE001 — fail-open
+            logger.warning("Appointment scan: suppression fetch failed", error=str(e))
+            return {"source_keys": [], "descriptors": []}
+
+    def _is_blocked_source(self, email: Any, blocked_sources: set) -> bool:
+        """True if the email's sender is on the user's hard blocklist — matched
+        on the parsed address (and the raw From as a fallback)."""
+        if not blocked_sources:
+            return False
+        addr = extract_email(email.sender) or ""
+        return addr in blocked_sources or (email.sender or "") in blocked_sources
 
     # ── Persistent per-user dedup ("{uid}:{message_id}", 7-day TTL) ─────────────
 
