@@ -110,6 +110,27 @@ _EXTRACT_SYSTEM = (
 )
 
 
+def _min_one_hour_end(start_iso: str, end_iso: str) -> str:
+    """Guarantee at least a 1-hour event. The extractor often invents a short,
+    odd end (e.g. a 47-minute duration) instead of leaving it empty, so honor an
+    explicit end only when it's at least an hour after start; otherwise default
+    to start + 1h (what calendar apps do). Returns an ISO string; if start can't
+    be parsed, leaves the end as-is and lets add_event's own default backstop."""
+    try:
+        s = datetime.fromisoformat(start_iso)
+    except (ValueError, TypeError):
+        return end_iso
+    e = None
+    if end_iso:
+        try:
+            e = datetime.fromisoformat(end_iso)
+        except (ValueError, TypeError):
+            e = None
+    if e is None or e < s + timedelta(hours=1):
+        e = s + timedelta(hours=1)
+    return e.isoformat()
+
+
 class AppointmentScanAgent(IJarvisAgent):
     """Background agent that proposes calendar events extracted from unread mail."""
 
@@ -341,7 +362,9 @@ class AppointmentScanAgent(IJarvisAgent):
         return {
             "title": title,
             "start": start,
-            "end": str(parsed.get("end") or "").strip(),
+            # The model is unreliable at end times — enforce a sensible >= 1h
+            # duration rather than trusting an invented short end.
+            "end": _min_one_hour_end(start, str(parsed.get("end") or "").strip()),
             "location": str(parsed.get("location") or "").strip(),
         }
 

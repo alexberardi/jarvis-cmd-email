@@ -304,7 +304,8 @@ class TestExtraction:
         appt = agent._extract_appointment(_make_email(1))
         assert appt is not None
         assert appt["title"] == "Dentist cleaning"
-        assert appt["end"] == ""
+        # An empty end now defaults to start + 1h (see _min_one_hour_end).
+        assert appt["end"] == "2026-08-12T16:00:00"
         assert appt["location"] == ""
 
     def test_think_tags_stripped(self, agent, monkeypatch):
@@ -652,3 +653,30 @@ class TestSuppression:
         suppress = next(e for e in els if e["callback"] == "suppress")
         assert suppress["data"]["source"] == "sender3@example.com"
         assert "Subject 3" in suppress["data"]["descriptor"]
+
+
+# ── end-time defaulting (the model invents short ends) ───────────────────────
+
+
+class TestEndDefault:
+    def test_min_one_hour_end(self):
+        f = _agent_mod._min_one_hour_end
+        # a short/odd end (what the model tends to invent) → bumped to start + 1h
+        assert f("2026-08-12T15:00:00", "2026-08-12T15:47:00") == "2026-08-12T16:00:00"
+        # missing end → start + 1h
+        assert f("2026-08-12T15:00:00", "") == "2026-08-12T16:00:00"
+        # an explicit >= 1h end is honored
+        assert f("2026-08-12T15:00:00", "2026-08-12T17:00:00") == "2026-08-12T17:00:00"
+        # exactly 1h is honored
+        assert f("2026-08-12T15:00:00", "2026-08-12T16:00:00") == "2026-08-12T16:00:00"
+
+    def test_extraction_defaults_short_end_to_one_hour(self, agent, storage_backend, inbox_backend, monkeypatch):
+        _wire_service(monkeypatch, [_make_email(4)])
+        _install_fake_proposal_client(monkeypatch, {"source_keys": [], "descriptors": []})
+        # Model returns a 47-minute end — must be bumped to a 1-hour event.
+        short = _appointment_json(start="2026-08-14T19:00:00", end="2026-08-14T19:47:00")
+        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: short)
+        _run(agent)
+        confirm = _confirm_element(inbox_backend.calls[0])
+        assert confirm["data"]["start"] == "2026-08-14T19:00:00"
+        assert confirm["data"]["end"] == "2026-08-14T20:00:00"
