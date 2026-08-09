@@ -369,6 +369,9 @@ class AppointmentScanAgent(IJarvisAgent):
             },
             idempotency_key=idempotency_key,
             editable=["title", "start", "end", "location"],
+            # Mobile renders start/end as date/time pickers (falls back to a text
+            # box on older builds that don't know input_type=datetime).
+            field_types={"start": "datetime", "end": "datetime"},
             title="Add to your calendar?",
             summary=email.subject,
             source=source,
