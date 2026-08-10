@@ -1,11 +1,11 @@
 name: "email"
 display_name: "Email (Gmail & IMAP)"
 description: "Full email management — list, read, search, send, reply, archive, trash, and star. Supports Gmail (OAuth) and IMAP/SMTP (Proton Mail, Yahoo, etc.). Includes VIP alerts and daily digest agent."
-version: "1.0.4"
+version: "1.1.0"
 min_jarvis_version: "0.1.114"
 # Floors enforced at install since node v0.1.114. This package needs the SDK's
 # JarvisInbox (0.3.3) and JarvisSecret value_type "user" (0.3.4).
-min_sdk_version: "0.3.4"
+min_sdk_version: "0.7.0"
 license: Apache-2.0
 author:
   github: "alexberardi"
