@@ -378,6 +378,12 @@ class AppointmentScanAgent(IJarvisAgent):
         # injects as a negative example to also skip look-alikes.
         source = extract_email(email.sender) or (email.sender or "")
         descriptor = f'appointment emails like "{email.subject}" from {email.sender}'
+        # Show the source email on the card so the user can verify the extracted
+        # title/time/location against what the message actually said.
+        excerpt = (getattr(email, "body", "") or getattr(email, "snippet", "") or "").strip()
+        if len(excerpt) > 600:
+            excerpt = excerpt[:600].rstrip() + "…"
+        card_body = f"From: {email.sender}\n\n{excerpt}".rstrip()
         return JarvisInbox("appointment_scan").propose_action(
             target_command=TARGET_COMMAND,
             action=TARGET_ACTION,
@@ -397,6 +403,7 @@ class AppointmentScanAgent(IJarvisAgent):
             field_types={"start": "datetime", "end": "datetime"},
             title="Add to your calendar?",
             summary=email.subject,
+            body=card_body,
             source=source,
             descriptor=descriptor,
             user_id=uid,

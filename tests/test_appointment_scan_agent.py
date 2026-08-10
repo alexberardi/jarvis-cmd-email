@@ -680,3 +680,15 @@ class TestEndDefault:
         confirm = _confirm_element(inbox_backend.calls[0])
         assert confirm["data"]["start"] == "2026-08-14T19:00:00"
         assert confirm["data"]["end"] == "2026-08-14T20:00:00"
+
+
+class TestCardBody:
+    def test_card_body_includes_source_email(self, agent, storage_backend, inbox_backend, monkeypatch):
+        _wire_service(monkeypatch, [_make_email(5)])  # "Sender 5 <sender5@example.com>", body "Body 5"
+        _install_fake_proposal_client(monkeypatch, {"source_keys": [], "descriptors": []})
+        _install_fake_node_llm_client(monkeypatch, lambda *a, **kw: _appointment_json())
+        _run(agent)
+        body = inbox_backend.calls[0]["body"]
+        # The source email rides on the card so the user can verify the extraction.
+        assert "sender5@example.com" in body
+        assert "Body 5" in body
