@@ -315,12 +315,20 @@ class AppointmentScanAgent(IJarvisAgent):
             f"{email.body or email.snippet}"
         )
 
-        system = _EXTRACT_SYSTEM
+        # Anchor relative dates to a CORRECT "today" — the model otherwise
+        # invents today's date (seen: it thought today was months off) and then
+        # "corrects" an explicit date to match the stated weekday (8/11 -> 8/13).
+        today = datetime.now().strftime("%A, %B %d, %Y")
+        system = (
+            _EXTRACT_SYSTEM
+            + f"\n\nTODAY is {today}. Resolve any relative date against TODAY. If "
+            "the email gives an explicit calendar date (e.g. 'August 11th'), use "
+            "that exact date verbatim — do NOT shift it to match a stated weekday."
+        )
         if descriptors:
             blocked = "\n".join(f"- {d}" for d in descriptors[:20])
-            system = (
-                _EXTRACT_SYSTEM
-                + "\n\nThe user has asked you to STOP proposing certain things. If "
+            system += (
+                "\n\nThe user has asked you to STOP proposing certain things. If "
                 "this email is one of these — or clearly the same kind — set "
                 f"has_appointment to false:\n{blocked}"
             )

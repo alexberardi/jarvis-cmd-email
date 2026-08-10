@@ -692,3 +692,18 @@ class TestCardBody:
         # The source email rides on the card so the user can verify the extraction.
         assert "sender5@example.com" in body
         assert "Body 5" in body
+
+
+class TestDateAnchor:
+    def test_extraction_prompt_anchors_today(self, agent, monkeypatch):
+        seen = {}
+
+        def _ask(prompt, system=None):
+            seen["system"] = system
+            return _appointment_json()
+
+        _install_fake_node_llm_client(monkeypatch, _ask)
+        agent._extract_appointment(_make_email(1))
+        # A correct "today" + a "don't shift to weekday" rule ground the parse.
+        assert "TODAY is" in seen["system"]
+        assert "do NOT shift" in seen["system"]
