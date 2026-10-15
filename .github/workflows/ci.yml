@@ -5,6 +5,4 @@ on:
     branches: [main]
 jobs:
   ci:
-    uses: alexberardi/jarvis-developer-toolkit/.github/workflows/package-ci.yml@loop/package-ci
-    with:
-      toolkit-ref: loop/package-ci
+    uses: alexberardi/jarvis-developer-toolkit/.github/workflows/package-ci.yml@main
