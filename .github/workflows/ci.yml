@@ -1,0 +1,8 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  ci:
+    uses: alexberardi/jarvis-developer-toolkit/.github/workflows/package-ci.yml@main

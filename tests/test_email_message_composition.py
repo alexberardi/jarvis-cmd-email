@@ -61,7 +61,7 @@ def _make_email(idx: int):
 
 
 def _make_req(is_pre_routed: bool):
-    from core.request_information import RequestInformation
+    from jarvis_command_sdk import RequestInformation
     return RequestInformation(
         voice_command="check my email",
         conversation_id="c",
