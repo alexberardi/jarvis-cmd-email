@@ -86,7 +86,8 @@ def save_attachments(msg: email_lib.message.Message, dest_dir: str) -> list[str]
 
 def folder_for(subject: str, date_tag: str) -> str:
     """The attachments folder for one email: <date> <subject>, under ATTACHMENTS_DIR."""
-    label = safe_name(f"{date_tag} {subject}".strip())[:80]
+    # A subject is a label, not a path: keep what's before a slash instead of taking the basename.
+    label = safe_name(re.sub(r"[/\\]", "_", f"{date_tag} {subject}".strip()))[:80]
     return os.path.join(ATTACHMENTS_DIR, label)
 
 

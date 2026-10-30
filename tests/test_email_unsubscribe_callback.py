@@ -50,6 +50,7 @@ def _install_email_shared() -> None:
         esf.get_email_provider = lambda: "gmail"
         sys.modules["email_shared.email_service_factory"] = esf
     _load_real("email_shared.triage", "email_shared", "triage.py")
+    _load_real("email_shared.attachments", "email_shared", "attachments.py")
 
 
 _install_email_shared()

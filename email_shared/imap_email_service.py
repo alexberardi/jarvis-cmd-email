@@ -220,6 +220,9 @@ class ImapEmailService:
         conn = self._connect_imap()
         try:
             folder = self._drafts_folder(conn)
+            if folder is None:
+                folder = "Drafts"
+                conn.create(_quote_mailbox(folder))  # a server with no Drafts folder yet
             status, data = conn.append(
                 _quote_mailbox(folder), "(\\Draft \\Seen)", imaplib.Time2Internaldate(time.time()), msg.as_bytes(),
             )
@@ -233,8 +236,8 @@ class ImapEmailService:
                 pass
 
     @staticmethod
-    def _drafts_folder(conn: imaplib.IMAP4) -> str:
-        """The folder marked \\Drafts (RFC 6154), else one named Drafts."""
+    def _drafts_folder(conn: imaplib.IMAP4) -> str | None:
+        """The folder marked \\Drafts (RFC 6154), else one named Drafts, else None."""
         status, data = conn.list()
         names = []
         for line in (data or []) if status == "OK" else []:
@@ -250,7 +253,7 @@ class ImapEmailService:
         for name in names:
             if name.lower().rsplit("/", 1)[-1].rsplit(".", 1)[-1] == "drafts":
                 return name
-        return "Drafts"
+        return None
 
     # -- Send / Reply -----------------------------------------------------------
 

@@ -29,6 +29,7 @@ def _stub_email_shared() -> None:
     tr.build_triage_payload = lambda emails: ({}, {})
     tr.build_triage_body = lambda emails: ""
     sys.modules["email_shared.triage"] = tr
+    sys.modules["email_shared.attachments"] = types.ModuleType("email_shared.attachments")
 
 
 def _load_command():
