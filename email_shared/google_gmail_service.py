@@ -8,6 +8,7 @@ prompts the user.
 import base64
 import re
 from datetime import datetime
+from email.message import Message
 from email.mime.text import MIMEText
 from email.utils import parsedate_to_datetime
 
@@ -140,6 +141,46 @@ class GoogleGmailService:
         except Exception as e:
             logger.error("Failed to fetch message", message_id=message_id, error=str(e))
             return None
+
+    def fetch_raw(self, message_id: str) -> bytes | None:
+        """The whole RFC 822 message (attachments included)."""
+        try:
+            response = httpx.get(
+                f"{BASE_URL}/users/me/messages/{message_id}",
+                params={"format": "raw"},
+                headers=self._headers(),
+                timeout=60.0,
+            )
+        except _GMAIL_CONNECT_ERRORS as e:
+            raise EmailConnectionError(_GMAIL_UNREACHABLE) from e
+        if response.status_code == 401:
+            self._flag_reauth()
+            return None
+        response.raise_for_status()
+        raw = response.json().get("raw", "")
+        return base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)) if raw else None
+
+    # -- Drafts -----------------------------------------------------------------
+
+    def create_draft(self, msg: Message, thread_id: str = "") -> dict:
+        """Save msg as a Gmail draft in its thread (drafts.create). Never sends."""
+        message: dict = {"raw": base64.urlsafe_b64encode(msg.as_bytes()).decode("ascii")}
+        if thread_id:
+            message["threadId"] = thread_id
+        try:
+            response = httpx.post(
+                f"{BASE_URL}/users/me/drafts",
+                json={"message": message},
+                headers=self._headers(),
+                timeout=60.0,
+            )
+        except _GMAIL_CONNECT_ERRORS as e:
+            raise EmailConnectionError(_GMAIL_UNREACHABLE) from e
+        if response.status_code in (401, 403):
+            self._flag_reauth()
+            raise RuntimeError("Gmail authentication expired. Please re-authenticate Gmail in the app.")
+        response.raise_for_status()
+        return {"id": response.json().get("id", ""), "folder": "Drafts", "status": "draft"}
 
     # -- Send / Reply -----------------------------------------------------------
 

@@ -12,7 +12,9 @@ import email as email_lib
 import imaplib
 import re
 import smtplib
+import time
 from datetime import datetime, timedelta, timezone
+from email.message import Message
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid, parsedate_to_datetime
 
@@ -37,6 +39,13 @@ from .email_message import (
 # covers protocol-level failures (abort subclasses error) including the EOF
 # aborts the Proton Bridge produces when it's down.
 _IMAP_CONNECT_ERRORS = (OSError, EOFError, imaplib.IMAP4.error)
+
+# One LIST response line: (\\HasNoChildren \\Drafts) "/" "Drafts"
+_LIST_RE = re.compile(r'^\((?P<flags>[^)]*)\)\s+(?:"[^"]*"|NIL)\s+(?P<name>.+)$')
+
+
+def _quote_mailbox(name: str) -> str:
+    return '"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 class ImapEmailService:
@@ -188,6 +197,60 @@ class ImapEmailService:
         except Exception as e:
             logger.error("Failed to fetch IMAP message", message_id=message_id, error=str(e))
             return None
+
+    def fetch_raw(self, message_id: str) -> bytes | None:
+        """The whole RFC 822 message by UID (attachments included), without marking it read."""
+        conn = self._connect_imap()
+        try:
+            conn.select("INBOX", readonly=True)
+            status, data = conn.uid("FETCH", message_id, "(BODY.PEEK[])")
+            if status != "OK" or not data or not isinstance(data[0], tuple):
+                return None
+            return data[0][1]
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    # -- Drafts -----------------------------------------------------------------
+
+    def create_draft(self, msg: Message, thread_id: str = "") -> dict:
+        """Store msg in the mailbox's Drafts folder (APPEND, flagged \\Draft). Never sends."""
+        conn = self._connect_imap()
+        try:
+            folder = self._drafts_folder(conn)
+            status, data = conn.append(
+                _quote_mailbox(folder), "(\\Draft \\Seen)", imaplib.Time2Internaldate(time.time()), msg.as_bytes(),
+            )
+            if status != "OK":
+                raise RuntimeError(f"The mail server refused the draft: {data!r}")
+            return {"id": str(msg.get("Message-ID", "")), "folder": folder, "status": "draft"}
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _drafts_folder(conn: imaplib.IMAP4) -> str:
+        """The folder marked \\Drafts (RFC 6154), else one named Drafts."""
+        status, data = conn.list()
+        names = []
+        for line in (data or []) if status == "OK" else []:
+            if not isinstance(line, bytes):
+                continue
+            m = _LIST_RE.match(line.decode("utf-8", errors="replace"))
+            if not m:
+                continue
+            name = m.group("name").strip('"')
+            if "\\drafts" in m.group("flags").lower():
+                return name
+            names.append(name)
+        for name in names:
+            if name.lower().rsplit("/", 1)[-1].rsplit(".", 1)[-1] == "drafts":
+                return name
+        return "Drafts"
 
     # -- Send / Reply -----------------------------------------------------------
 
