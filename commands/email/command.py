@@ -49,6 +49,7 @@ try:
 except ImportError:  # pragma: no cover - only hit on pre-0.4.0 nodes
     ReferenceableItem = None
 
+from email_shared import attachments
 from email_shared.email_message import EmailConnectionError, EmailMessage, extract_email
 from email_shared.email_service_factory import create_email_service, get_email_provider
 from email_shared.triage import build_triage_body, build_triage_payload
@@ -69,7 +70,7 @@ _ORDINALS: dict[str, int] = {
 _ALL_ACTIONS = [
     "list", "read", "search", "send", "reply", "forward",
     "archive", "trash", "star", "unstar", "mark_read", "mark_unread", "triage",
-    "unsubscribe_scan",
+    "unsubscribe_scan", "save_attachments", "draft_reply",
 ]
 
 # Triage callback verb -> spoken result template ({n} = success count).
@@ -222,6 +223,8 @@ class EmailCommand(IJarvisCommand):
     def __init__(self) -> None:
         super().__init__()
         self._last_email_list: list[EmailMessage] = []
+        # (query, message id) save_attachments last picked: draft_reply answers the same email.
+        self._attachment_pick: tuple[str, str] | None = None
         self._storage = JarvisStorage("email")
         # Per-sender actuation records written by the unsubscribe scan and
         # read back in the unsubscribe_selected callback (24h TTL).
@@ -281,7 +284,11 @@ class EmailCommand(IJarvisCommand):
             ),
             JarvisParameter(
                 "body", "string", required=False,
-                description="Email body text (for send/reply actions)",
+                description="Email body text (for send/reply/draft_reply actions)",
+            ),
+            JarvisParameter(
+                "attachments", "string", required=False,
+                description="Files to attach (for draft_reply): paths under ~/Documents, comma-separated",
             ),
         ]
 
@@ -305,6 +312,8 @@ class EmailCommand(IJarvisCommand):
             "'unstar' removes the star from an email",
             "Use 'triage' to send an interactive list of unread emails to the user's phone",
             "Use 'unsubscribe_scan' to find subscription senders the user never reads and send an unsubscribe picker to their phone",
+            "Use 'save_attachments' with a query (or email_index) to save an email's attached files to ~/Documents/Jarvis/Attachments",
+            "Use 'draft_reply' with a query (or email_index) + body (+ attachments) to put a reply in the mailbox's Drafts folder for the user to review and send; it never sends",
             "Email indices are 1-based from the most recent list/search results",
         ]
 
@@ -915,6 +924,10 @@ class EmailCommand(IJarvisCommand):
                 return self._run_triage(request_info, **kwargs)
             elif action == "unsubscribe_scan":
                 return self._run_unsubscribe_scan(request_info, **kwargs)
+            elif action == "save_attachments":
+                return self._run_save_attachments(**kwargs)
+            elif action == "draft_reply":
+                return self._run_draft_reply(**kwargs)
             else:
                 return CommandResponse.error_response(
                     error_details=f"Unknown email action: {action}"
@@ -1173,6 +1186,103 @@ class EmailCommand(IJarvisCommand):
             IJarvisButton("Cancel", "cancel_click", "destructive", None, "Cancelled."),
         ]
         return resp
+
+    def _find_email(self, service, kwargs: dict[str, Any], with_attachments: bool):
+        """The email a query or index names, with its raw bytes: (EmailMessage, Message) or an error.
+
+        A query takes the newest match; with_attachments the newest match that has files. The
+        email save_attachments last picked for the same query wins, so a later draft_reply in
+        the same errand answers the email whose files were worked on.
+        """
+        query: str | None = kwargs.get("query")
+        if kwargs.get("email_index") is not None:
+            msg = self._resolve_index(kwargs["email_index"])
+            if isinstance(msg, CommandResponse):
+                return msg
+            candidates = [msg]
+        elif query:
+            candidates = service.search(query, max_results=10)
+            picked = self._attachment_pick
+            if picked and picked[0] == query:
+                candidates = [e for e in candidates if e.id == picked[1]] or candidates
+        else:
+            return CommandResponse.error_response(
+                error_details="Say which email: a search like 'from:dana timesheet', or its number in the last list."
+            )
+        for em in candidates:
+            raw = service.fetch_raw(em.id)
+            if raw is None:
+                continue
+            parsed = attachments.parse_raw(raw)
+            if not with_attachments or attachments.attachment_parts(parsed):
+                return em, parsed
+        what = "with attachments " if with_attachments else ""
+        return CommandResponse.error_response(
+            error_details=f"I couldn't find an email {what}matching '{query or kwargs.get('email_index')}'.",
+            context_data={"error": "not_found"},
+        )
+
+    def _run_save_attachments(self, **kwargs: Any) -> CommandResponse:
+        service = self._get_service()
+        found = self._find_email(service, kwargs, with_attachments=True)
+        if isinstance(found, CommandResponse):
+            return found
+        em, parsed = found
+        folder = attachments.folder_for(em.subject, em.date.strftime("%Y-%m-%d"))
+        saved = attachments.save_attachments(parsed, folder)
+        if not saved:
+            return CommandResponse.error_response(error_details="The email's attachments were too big to save.")
+        if kwargs.get("query"):
+            self._attachment_pick = (kwargs["query"], em.id)
+        names = ", ".join(p.rsplit("/", 1)[-1] for p in saved)
+        return CommandResponse.success_response(
+            context_data={
+                "message": f"Saved {len(saved)} attachment(s) from {em.sender_name}'s email '{em.subject}': {names}.",
+                "saved_files": saved,
+                "email": {
+                    "id": em.id,
+                    "sender": em.sender_name,
+                    "sender_email": extract_email(em.sender),
+                    "subject": em.subject,
+                    "date": em.date.isoformat(),
+                    "body": attachments.text_body(parsed, 3000),
+                },
+            },
+            wait_for_input=False,
+        )
+
+    def _run_draft_reply(self, **kwargs: Any) -> CommandResponse:
+        body: str = (kwargs.get("body") or "").strip()
+        if not body:
+            return CommandResponse.error_response(error_details="Missing reply body. What should the draft say?")
+        paths = kwargs.get("attachments") or []
+        if isinstance(paths, str):
+            paths = [p.strip() for p in paths.split(",") if p.strip()]
+        try:
+            files = [attachments.draft_file(p) for p in paths]
+        except ValueError as e:
+            return CommandResponse.error_response(error_details=str(e), context_data={"error": "bad_attachment"})
+        service = self._get_service()
+        found = self._find_email(service, kwargs, with_attachments=False)
+        if isinstance(found, CommandResponse):
+            return found
+        em, parsed = found
+        sender = getattr(service, "username", "")
+        draft = attachments.build_reply_draft(parsed, sender, body, files)
+        result = service.create_draft(draft, thread_id=em.thread_id if get_email_provider() == "gmail" else "")
+        names = ", ".join(f.rsplit("/", 1)[-1] for f in files)
+        attached = f" with {names} attached" if names else ""
+        return CommandResponse.success_response(
+            context_data={
+                "message": (
+                    f"I put a reply to {em.sender_name} in your {result.get('folder', 'Drafts')} folder{attached}. "
+                    "It hasn't been sent: review it in your mail app and send it from there."
+                ),
+                "draft": {"id": result.get("id", ""), "to": str(draft["To"]), "subject": str(draft["Subject"]),
+                          "attachments": files, "folder": result.get("folder", "Drafts")},
+            },
+            wait_for_input=False,
+        )
 
     def _run_archive(self, **kwargs: Any) -> CommandResponse:
         email_index: int | None = kwargs.get("email_index")
