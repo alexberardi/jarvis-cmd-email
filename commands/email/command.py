@@ -7,6 +7,7 @@ Supports multiple email backends via EMAIL_PROVIDER secret:
 
 import re
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage as MimeMessage  # email_shared has its own EmailMessage
 from typing import Any, Dict, List
 
 import requests
@@ -36,6 +37,7 @@ from jarvis_command_sdk import (
     JarvisSecret,
     JarvisStorage,
     PreRouteResult,
+    ProposableAction,
     RequestInformation,
     callback,
     get_current_user_id,
@@ -216,6 +218,9 @@ def _as_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+_EMAIL_ADDRESS_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class EmailCommand(IJarvisCommand):
@@ -1629,6 +1634,69 @@ class EmailCommand(IJarvisCommand):
         return CommandResponse.error_response(
             error_details=details,
             context_data={"message": message},
+        )
+
+    # ── Call follow-up: a new draft the business asked for ─────────────────
+
+    @property
+    def proposable_actions(self) -> List[ProposableAction]:
+        """``draft_from_call`` on a phone call's Call finished card (jarvis-server
+        docs/cc/phone-followups.md). Only when the node's SDK knows offer_after_calls: an older
+        SDK would reject the keyword and the command would not load."""
+        if "offer_after_calls" not in getattr(ProposableAction, "__dataclass_fields__", {}):
+            return []
+        return [
+            ProposableAction(
+                callback="draft_from_call",
+                params=[
+                    JarvisParameter("to", "string", required=True, description="The email address said on the call."),
+                    JarvisParameter("subject", "string", required=True, description="A short subject line."),
+                    JarvisParameter("body", "string", required=True, description="The message, in a few sentences."),
+                    JarvisParameter("idempotency_key", "string", required=True, description="Stable de-dup key."),
+                ],
+                card_title="Draft an email?",
+                confirm_label="Draft email",
+                editable=["to", "subject", "body"],
+                idempotency_param="idempotency_key",
+                offer_after_calls=(
+                    "the business asked the person to email them something (photos, a document, details) "
+                    "at an email address said on the call"
+                ),
+            )
+        ]
+
+    @callback("draft_from_call")
+    def draft_from_call(self, data: dict, request_info: RequestInformation) -> CommandResponse:
+        """Put a new email in the mailbox's Drafts folder; it is never sent from here."""
+        to = (data.get("to") or "").strip()
+        subject = (data.get("subject") or "").strip()
+        body = (data.get("body") or "").strip()
+        if not _EMAIL_ADDRESS_RE.match(to) or not body:
+            return CommandResponse.error_response(
+                error_details="draft_from_call needs an email address and a message.",
+                context_data={"message": "I need an email address and what to say."},
+            )
+        try:
+            service = self._get_service()
+            msg = MimeMessage()
+            msg["To"] = to
+            msg["From"] = getattr(service, "username", "")
+            msg["Subject"] = subject
+            msg.set_content(body)
+            result = service.create_draft(msg)
+        except Exception as exc:  # noqa: BLE001 — a mailbox error is the user's to see, not a crash
+            logger.warning(f"draft_from_call failed: {exc}")
+            return CommandResponse.error_response(
+                error_details=f"Couldn't save the draft: {exc}",
+                context_data={"message": "I couldn't save that draft to your mailbox."},
+            )
+        folder = result.get("folder", "Drafts") if isinstance(result, dict) else "Drafts"
+        return CommandResponse.success_response(
+            context_data={
+                "message": f"I put an email to {to} in your {folder} folder. It hasn't been sent: "
+                "review it in your mail app and send it from there."
+            },
+            wait_for_input=False,
         )
 
     # ── Triage callbacks: mobile checked emails, apply the chosen verb ─────
